@@ -57,7 +57,7 @@ GEMINI_PROXY_MAX_TEXT_CHARS = int(
     os.environ.get("GEMINI_PROXY_MAX_TEXT_CHARS", "120000")
 )
 GEMINI_PROXY_MAX_OUTPUT_TOKENS = int(
-    os.environ.get("GEMINI_PROXY_MAX_OUTPUT_TOKENS", "4096")
+    os.environ.get("GEMINI_PROXY_MAX_OUTPUT_TOKENS", "8192")
 )
 DEFAULT_CHROME_EXTENSION_ID = "ignpnhkdhhneglgihfgppmjdiibjphka"
 ALLOWED_EXTENSION_IDS = [

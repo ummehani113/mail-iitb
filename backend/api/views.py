@@ -1,10 +1,9 @@
 import email
-import hashlib
 import imaplib
 import json
 import re
 import ssl
-from datetime import date, datetime, time, timedelta, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 from email.header import decode_header
 from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
@@ -15,14 +14,9 @@ import requests
 from django.conf import settings
 from django.core.cache import cache
 from django.http import JsonResponse
-from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
-from .models import DayCoverage, EmailMessage, MailboxState
-
-GEMINI_AVAILABLE = False
-GEMINI_NEW_API = False
-DEFAULT_PROXY_MODEL = "gemini-2.5-flash"
+DEFAULT_PROXY_MODEL = "gemini-3.8-flash"
 SUPPORTED_PROXY_MODELS = {
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -39,20 +33,6 @@ RETIRED_PROXY_MODEL_REPLACEMENTS = {
     "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
 }
 PROXY_MODEL_FALLBACKS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
-
-try:
-    import google.generativeai as genai
-
-    GEMINI_AVAILABLE = True
-except ImportError:
-    try:
-        import google.genai as genai_new
-
-        GEMINI_AVAILABLE = True
-        GEMINI_NEW_API = True
-    except ImportError:
-        pass
-
 
 class HTMLTextExtractor(HTMLParser):
 
@@ -207,7 +187,7 @@ def format_received_label(raw_value):
         return raw_value[:32]
 
 
-def build_email_record(message, is_unread):
+def build_email_record(message, is_unread, uid=None):
     raw_from = decode_mime_header(message.get("From", ""))
     sender_name, sender_email = parseaddr(raw_from)
     sender_name = sender_name.strip() or sender_email or "Unknown sender"
@@ -219,6 +199,7 @@ def build_email_record(message, is_unread):
     snippet_source = body or fallback_text
 
     return {
+        "uid": uid,
         "subject": subject,
         "sender": sender_name,
         "sender_email": sender_email,
@@ -228,94 +209,6 @@ def build_email_record(message, is_unread):
         "snippet": build_snippet(snippet_source, 320),
         "body_excerpt": build_snippet(snippet_source, 900),
     }
-
-
-def build_model_input(email_records, char_limit=26000):
-    if not email_records:
-        return ""
-
-    per_email_limit = clamp((char_limit // len(email_records)) - 120, 180, 900)
-    sections = []
-
-    for index, record in enumerate(email_records, start=1):
-        sections.append(
-            "\n".join(
-                [
-                    f"EMAIL {index}",
-                    f"Status: {record['status'].upper()}",
-                    f"Source: {record['source'].upper()}",
-                    f"From: {record['sender']}" + (
-                        f" <{record['sender_email']}>" if record["sender_email"] else ""
-                    ),
-                    f"Subject: {record['subject']}",
-                    f"Received: {record['received_label']}",
-                    f"Content: {build_snippet(record['body_excerpt'] or record['snippet'], per_email_limit)}",
-                ]
-            )
-        )
-
-    return "\n\n---\n\n".join(sections)
-
-
-def generate_text(prompt):
-    if not GEMINI_AVAILABLE:
-        return ""
-
-    if not GEMINI_NEW_API:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        return getattr(response, "text", "") or ""
-
-    client = genai_new.Client(api_key=settings.GEMINI_API_KEY)
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-    return response.text if hasattr(response, "text") else str(response)
-
-
-def summarize_email_group(email_records, category_name, summary_date):
-    if not email_records:
-        return f"No {category_name.lower()} emails on {summary_date.isoformat()}."
-
-    prompt = f"""
-You are creating a structured daily inbox digest for an IIT Bombay student.
-
-Summarize the following {category_name.lower()} emails from {summary_date.isoformat()}.
-
-Output rules:
-- Start with the exact heading: {category_name} EMAILS
-- Group related emails under bold headings using Markdown syntax like **Heading**
-- Under each heading, add 2-4 bullet points
-- Explicitly mention deadlines, required actions, and meeting times
-- If an important email is from outside IIT Bombay, mention "(External)" in the heading or bullet
-- Ignore boilerplate and signatures
-- Maximum 220 words
-
-Emails:
-{build_model_input(email_records, char_limit=26000)}
-"""
-
-    summary = generate_text(prompt).strip()
-    if summary:
-        return summary
-
-    return f"DEBUG: {len(email_records)} {category_name.lower()} emails found for {summary_date.isoformat()}."
-
-
-def extract_json_object(text):
-    if not text:
-        return None
-
-    match = re.search(r"\{[\s\S]*\}", text)
-    if not match:
-        return None
-
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
 
 
 def build_stats(email_records, mailbox_total):
@@ -547,112 +440,22 @@ def sanitize_proxy_payload(payload):
             requested_max_tokens = candidate_tokens
 
     max_output_tokens = max(int(getattr(settings, "GEMINI_PROXY_MAX_OUTPUT_TOKENS", 1536)), 256)
-    sanitized_payload["generationConfig"] = {
+    generation_config = {
         "maxOutputTokens": min(requested_max_tokens or max_output_tokens, max_output_tokens)
     }
 
+    if isinstance(requested_generation_config, dict):
+        temperature = requested_generation_config.get("temperature")
+        if isinstance(temperature, (int, float)) and not isinstance(temperature, bool):
+            generation_config["temperature"] = min(max(float(temperature), 0.0), 2.0)
+
+        mime_type = requested_generation_config.get("responseMimeType")
+        if mime_type in ("application/json", "text/plain"):
+            generation_config["responseMimeType"] = mime_type
+
+    sanitized_payload["generationConfig"] = generation_config
+
     return sanitized_payload, None, 200
-
-
-def fallback_overview(stats, summary_date):
-    return (
-        f"{stats['total']} inbox emails arrived on {summary_date.isoformat()}: {stats['unread']} unread and "
-        f"{stats['read']} read. {stats['external_total']} came from outside IIT Bombay."
-    )
-
-
-def fallback_action_items(email_records):
-    keywords = (
-        "deadline",
-        "due",
-        "submit",
-        "meeting",
-        "interview",
-        "register",
-        "payment",
-        "exam",
-        "quiz",
-        "assignment",
-    )
-    actions = []
-    for record in email_records:
-        haystack = f"{record['subject']} {record['snippet']}".lower()
-        if any(keyword in haystack for keyword in keywords):
-            actions.append(
-                {
-                    "title": record["subject"],
-                    "detail": record["snippet"],
-                    "priority": "high" if record["status"] == "unread" else "medium",
-                    "status": record["status"],
-                    "source": record["source"],
-                }
-            )
-        if len(actions) >= 5:
-            break
-    return actions
-
-
-def generate_digest_insights(email_records, stats, summary_date):
-    if not email_records:
-        return "", []
-
-    prompt = f"""
-You are generating an actionable inbox digest for an IIT Bombay student.
-
-Return JSON only in this format:
-{{
-  "overview": "1-2 concise sentences",
-  "action_items": [
-    {{
-      "title": "short action title",
-      "detail": "what to do and any deadline/time if available",
-      "priority": "high | medium | low",
-      "status": "unread | read",
-      "source": "internal | external"
-    }}
-  ]
-}}
-
-Rules:
-- Include only concrete actions, deadlines, submissions, meetings, interviews, payments, registrations, or approvals
-- Sort action_items by urgency
-- Maximum 5 action_items
-- Mention if an action comes from an external sender when relevant
-- If no action exists, return an empty array
-
-Email stats for {summary_date.isoformat()}:
-- Total emails: {stats['total']}
-- Unread emails: {stats['unread']}
-- External emails: {stats['external_total']}
-
-Emails:
-{build_model_input(email_records, char_limit=22000)}
-"""
-
-    parsed = extract_json_object(generate_text(prompt))
-    if not parsed:
-        return fallback_overview(stats, summary_date), fallback_action_items(email_records)
-
-    overview = parsed.get("overview") or fallback_overview(stats, summary_date)
-    action_items = parsed.get("action_items")
-    if not isinstance(action_items, list):
-        action_items = fallback_action_items(email_records)
-
-    normalized_items = []
-    for item in action_items[:5]:
-        if not isinstance(item, dict):
-            continue
-        normalized_items.append(
-            {
-                "title": str(item.get("title", "")).strip() or "Action item",
-                "detail": str(item.get("detail", "")).strip(),
-                "priority": str(item.get("priority", "medium")).strip().lower() or "medium",
-                "status": str(item.get("status", "unread")).strip().lower() or "unread",
-                "source": str(item.get("source", "internal")).strip().lower() or "internal",
-            }
-        )
-
-    return overview, normalized_items
 
 
 @csrf_exempt
@@ -737,234 +540,16 @@ def gemini_proxy(request):
         return JsonResponse({"error": str(exc)}, status=500)
 
 
-def daily_summary_api(request):
-    requested_date, date_error = parse_requested_summary_date(request)
-    if date_error:
-        return JsonResponse(
-            {"status": "error", "message": date_error},
-            status=400,
-        )
-
-    print(f"[API] daily_summary_api called for {requested_date.isoformat()}")
-
-    mail = None
-    try:
-        user = request.headers.get("X-LDAP-User")
-        password = request.headers.get("X-LDAP-Pass")
-
-        if not user or not password:
-            return JsonResponse(
-                {"status": "error", "message": "LDAP credentials missing"},
-                status=401,
-            )
-
-        mail = connect_to_iitb_imap()
-
-        mail.login(user, password)
-        mail.select("inbox", readonly=True)
-
-        imap_start = requested_date.strftime("%d-%b-%Y")
-        imap_end = (requested_date + timedelta(days=1)).strftime("%d-%b-%Y")
-
-        all_status, all_messages = mail.search(None, f'(SINCE "{imap_start}" BEFORE "{imap_end}")')
-        unread_status, unread_messages = mail.search(
-            None,
-            f'(SINCE "{imap_start}" BEFORE "{imap_end}" UNSEEN)',
-        )
-
-        if all_status != "OK":
-            return JsonResponse(
-                {"status": "error", "message": "Failed to fetch inbox messages"},
-                status=500,
-            )
-
-        all_ids = list(reversed(all_messages[0].split()))
-        unread_ids = set(unread_messages[0].split()) if unread_status == "OK" else set()
-
-        if not all_ids:
-            return JsonResponse(
-                {
-                    "status": "success",
-                    "generated_for": requested_date.isoformat(),
-                    "overview": f"No inbox emails arrived on {requested_date.isoformat()}.",
-                    "stats": build_stats([], 0),
-                    "action_items": [],
-                    "external_highlights": [],
-                    "recent_emails": [],
-                    "unread_summary": f"No unread emails on {requested_date.isoformat()}.",
-                    "read_summary": f"No read emails on {requested_date.isoformat()}.",
-                }
-            )
-
-        email_records = []
-        for email_id in all_ids:
-            fetch_status, msg_data = mail.fetch(email_id, get_safe_fetch_query())
-            if fetch_status != "OK" or not msg_data:
-                continue
-
-            raw_message = next(
-                (item[1] for item in msg_data if isinstance(item, tuple) and len(item) > 1),
-                None,
-            )
-            if not raw_message:
-                continue
-
-            message = email.message_from_bytes(raw_message)
-            email_records.append(build_email_record(message, email_id in unread_ids))
-
-        stats = build_stats(email_records, len(all_ids))
-        unread_records = [record for record in email_records if record["status"] == "unread"]
-        read_records = [record for record in email_records if record["status"] == "read"]
-
-        overview, action_items = generate_digest_insights(email_records, stats, requested_date)
-        unread_summary = summarize_email_group(unread_records, "UNREAD", requested_date)
-        read_summary = summarize_email_group(read_records, "READ", requested_date)
-
-        external_highlights = sorted(
-            [record for record in email_records if record["source"] == "external"],
-            key=lambda record: (record["status"] != "unread",),
-        )[:5]
-
-        recent_emails = email_records
-
-        return JsonResponse(
-            {
-                "status": "success",
-                "generated_for": requested_date.isoformat(),
-                "overview": overview,
-                "stats": stats,
-                "action_items": action_items,
-                "external_highlights": external_highlights,
-                "recent_emails": recent_emails,
-                "unread_summary": unread_summary,
-                "read_summary": read_summary,
-            }
-        )
-
-    except ssl.SSLCertVerificationError as exc:
-        return JsonResponse(
-            {
-                "status": "error",
-                "message": (
-                    "Secure connection to IITB IMAP failed certificate verification. "
-                    f"Details: {exc}"
-                ),
-            },
-            status=502,
-        )
-    except ssl.SSLError as exc:
-        return JsonResponse(
-            {
-                "status": "error",
-                "message": f"Secure IMAP connection failed: {exc}",
-            },
-            status=502,
-        )
-    except Exception as exc:
-        return JsonResponse(
-            {
-                "status": "error",
-                "message": str(exc),
-            },
-            status=500,
-        )
-    finally:
-        if mail is not None:
-            try:
-                mail.logout()
-            except Exception:
-                pass
-
-
-MAIL_WINDOW_DEFAULT_DAYS = 15
-MAIL_WINDOW_MAX_DAYS = 45
-MAIL_WINDOW_BODY_LIMIT = 6000
-IMAP_FETCH_CHUNK_SIZE = 25
-IST_TIMEZONE = ZoneInfo("Asia/Kolkata")
-
-WINDOW_RECORD_FIELDS = (
-    "message_id",
-    "received_at",
-    "received_label",
-    "sender_name",
-    "sender_email",
-    "subject",
-    "body",
-    "snippet",
-    "excerpt",
-    "is_read",
-    "source",
-)
-
-
-def derive_user_key(username):
-    normalized = (username or "").strip().lower()
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:40]
-
-
-def current_ist_date():
-    return datetime.now(IST_TIMEZONE).date()
-
-
-def parse_message_datetime(raw_date):
-    if not raw_date:
-        return None
-
-    try:
-        parsed = parsedate_to_datetime(raw_date)
-    except (TypeError, ValueError, IndexError, OverflowError):
-        return None
-
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt_timezone.utc)
-    return parsed.astimezone(dt_timezone.utc)
-
-
-def read_uid_validity(mail):
-    try:
-        code, data = mail.response("UIDVALIDITY")
-    except Exception:
-        return ""
-
-    if not code or not data:
-        return ""
-
-    first = data[0] if isinstance(data, (list, tuple)) and data else data
-    if isinstance(first, bytes):
-        return first.decode("ascii", errors="ignore").strip()
-    return str(first or "").strip()
-
-
-def merge_contiguous_days(days):
-    if not days:
-        return []
-
-    ordered = sorted(set(days))
-    ranges = [(ordered[0], ordered[0])]
-    for day in ordered[1:]:
-        start, end = ranges[-1]
-        if day == end + timedelta(days=1):
-            ranges[-1] = (start, day)
-        else:
-            ranges.append((day, day))
-    return ranges
-
-
-def imap_search_range(mail, start_day, end_day, unseen_only=False):
-    imap_start = start_day.strftime("%d-%b-%Y")
-    imap_end = (end_day + timedelta(days=1)).strftime("%d-%b-%Y")
-    criteria = f'(SINCE "{imap_start}" BEFORE "{imap_end}"'
+def imap_search_uids(mail, start_day, end_day=None, unseen_only=False):
+    """UIDs of inbox mails received on start_day..end_day (end_day inclusive, open if None)."""
+    criteria = f'(SINCE "{start_day.strftime("%d-%b-%Y")}"'
+    if end_day is not None:
+        criteria += f' BEFORE "{(end_day + timedelta(days=1)).strftime("%d-%b-%Y")}"'
     if unseen_only:
         criteria += " UNSEEN"
     criteria += ")"
 
-    try:
-        status, data = mail.uid("search", None, criteria)
-    except Exception:
-        return []
-
+    status, data = mail.uid("search", None, criteria)
     if status != "OK" or not data or not data[0]:
         return []
     return [int(uid) for uid in data[0].split()]
@@ -993,7 +578,11 @@ def parse_fetched_messages(items):
     return messages
 
 
+IMAP_FETCH_CHUNK_SIZE = 25
+
+
 def fetch_messages_by_uid(mail, uids):
+    """Fetch full messages by UID in chunks, without marking them as read."""
     messages = {}
     for start in range(0, len(uids), IMAP_FETCH_CHUNK_SIZE):
         chunk = uids[start : start + IMAP_FETCH_CHUNK_SIZE]
@@ -1020,15 +609,143 @@ def fetch_messages_by_uid(mail, uids):
     return messages
 
 
-def build_window_record(message_obj, uid, is_read):
-    record = build_email_record(message_obj, is_read)
+def read_uid_validity(mail):
+    try:
+        code, data = mail.response("UIDVALIDITY")
+    except Exception:
+        return ""
+
+    if not code or not data:
+        return ""
+
+    first = data[0] if isinstance(data, (list, tuple)) and data else data
+    if isinstance(first, bytes):
+        return first.decode("ascii", errors="ignore").strip()
+    return str(first or "").strip()
+
+
+def imap_error_response(exc):
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        message = (
+            "Secure connection to IITB IMAP failed certificate verification. "
+            f"Details: {exc}"
+        )
+        return JsonResponse({"status": "error", "message": message}, status=502)
+    if isinstance(exc, ssl.SSLError):
+        return JsonResponse(
+            {"status": "error", "message": f"Secure IMAP connection failed: {exc}"},
+            status=502,
+        )
+    if isinstance(exc, imaplib.IMAP4.error) and "auth" in str(exc).lower():
+        return JsonResponse(
+            {"status": "error", "message": "IITB mail login failed. Check your LDAP ID and access token."},
+            status=401,
+        )
+    return JsonResponse({"status": "error", "message": str(exc)}, status=500)
+
+
+def safe_logout(mail):
+    if mail is None:
+        return
+    try:
+        mail.logout()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Daily Summary: returns the day's mails. The extension writes the summary.
+# --------------------------------------------------------------------------
+
+def daily_summary_api(request):
+    requested_date, date_error = parse_requested_summary_date(request)
+    if date_error:
+        return JsonResponse({"status": "error", "message": date_error}, status=400)
+
+    user = request.headers.get("X-LDAP-User")
+    password = request.headers.get("X-LDAP-Pass")
+    if not user or not password:
+        return JsonResponse({"status": "error", "message": "LDAP credentials missing"}, status=401)
+
+    print(f"[API] daily_summary_api called for {requested_date.isoformat()}")
+
+    mail = None
+    try:
+        mail = connect_to_iitb_imap()
+        mail.login(user, password)
+        mail.select("inbox", readonly=True)
+
+        # UIDs (not sequence numbers) so each mail can be opened in webmail later.
+        all_uids = sorted(imap_search_uids(mail, requested_date, requested_date), reverse=True)
+        unread_uids = set(imap_search_uids(mail, requested_date, requested_date, unseen_only=True))
+        messages = fetch_messages_by_uid(mail, all_uids)
+
+        emails = []
+        for uid in all_uids:
+            message_obj = messages.get(uid)
+            if message_obj is None:
+                continue
+            emails.append(build_email_record(message_obj, uid in unread_uids, uid=uid))
+
+        return JsonResponse(
+            {
+                "status": "success",
+                "generated_for": requested_date.isoformat(),
+                "stats": build_stats(emails, len(all_uids)),
+                "emails": emails,
+            }
+        )
+    except Exception as exc:
+        return imap_error_response(exc)
+    finally:
+        safe_logout(mail)
+
+
+# --------------------------------------------------------------------------
+# Chat mail window: stateless. The extension keeps the copy and tells us the
+# highest UID it already has; we only fetch newer mails. Nothing is stored.
+# --------------------------------------------------------------------------
+
+MAIL_WINDOW_DEFAULT_DAYS = 15
+MAIL_WINDOW_MAX_DAYS = 45
+MAIL_WINDOW_BODY_LIMIT = 6000
+MAIL_WINDOW_MAX_FETCH = 800
+IST_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+
+def current_ist_date():
+    return datetime.now(IST_TIMEZONE).date()
+
+
+def parse_message_datetime(raw_date):
+    if not raw_date:
+        return None
+
+    try:
+        parsed = parsedate_to_datetime(raw_date)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed.astimezone(dt_timezone.utc)
+
+
+def build_window_record(message_obj, uid, is_unread):
+    record = build_email_record(message_obj, is_unread, uid=uid)
     body = clean_extracted_text(extract_best_body(message_obj))[:MAIL_WINDOW_BODY_LIMIT]
-    received_at = parse_message_datetime(message_obj.get("Date", "")) or timezone.now()
+    received_at = (
+        parse_message_datetime(message_obj.get("Date", ""))
+        or datetime.now(dt_timezone.utc)
+    )
     message_id = (message_obj.get("Message-ID") or "").strip()[:255] or f"uid:{uid}"
 
     return {
+        "uid": uid,
         "message_id": message_id,
-        "received_at": received_at,
+        "received_at": received_at.isoformat(),
         "received_label": received_at.astimezone(IST_TIMEZONE).strftime("%d %b %H:%M"),
         "sender_name": record["sender"][:255],
         "sender_email": record["sender_email"][:255],
@@ -1036,70 +753,22 @@ def build_window_record(message_obj, uid, is_read):
         "body": body,
         "snippet": record["snippet"][:400],
         "excerpt": record["body_excerpt"][:1000],
-        "is_read": is_read,
+        "is_read": not is_unread,
         "source": record["source"],
     }
 
 
-def upsert_window_email(user_key, uid, record):
-    existing = EmailMessage.objects.filter(user_key=user_key, imap_uid=uid).first()
-    if existing is None:
-        EmailMessage.objects.create(user_key=user_key, imap_uid=uid, **record)
-        return "created"
-
-    changed = any(getattr(existing, field) != record[field] for field in WINDOW_RECORD_FIELDS)
-    if not changed:
-        return "unchanged"
-
-    for field in WINDOW_RECORD_FIELDS:
-        setattr(existing, field, record[field])
-    existing.save(update_fields=[*WINDOW_RECORD_FIELDS, "updated_at"])
-    return "updated"
-
-
-def count_window_emails_by_day(user_key, start_day, end_day):
-    range_start = datetime.combine(start_day, time.min, tzinfo=IST_TIMEZONE).astimezone(dt_timezone.utc)
-    range_end = datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=IST_TIMEZONE).astimezone(dt_timezone.utc)
-
-    counts = {}
-    rows = EmailMessage.objects.filter(
-        user_key=user_key,
-        received_at__gte=range_start,
-        received_at__lt=range_end,
-    ).values_list("received_at", flat=True)
-
-    for received_at in rows:
-        day = received_at.astimezone(IST_TIMEZONE).date()
-        counts[day] = counts.get(day, 0) + 1
-    return counts
-
-
-def mark_days_covered(user_key, start_day, end_day, counts_by_day):
-    day = start_day
-    while day <= end_day:
-        DayCoverage.objects.update_or_create(
-            user_key=user_key,
-            day=day,
-            defaults={"message_count": counts_by_day.get(day, 0)},
-        )
-        day += timedelta(days=1)
-
-
-def serialize_window_email(row):
-    return {
-        "uid": row.imap_uid,
-        "message_id": row.message_id,
-        "received_at": row.received_at.isoformat(),
-        "received_label": row.received_label,
-        "sender_name": row.sender_name,
-        "sender_email": row.sender_email,
-        "subject": row.subject,
-        "body": row.body,
-        "snippet": row.snippet,
-        "excerpt": row.excerpt,
-        "is_read": row.is_read,
-        "source": row.source,
-    }
+def parse_non_negative_int(raw_value, default=0):
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return default, None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None, "must be an integer"
+    if value < 0:
+        return None, "must not be negative"
+    return value, None
 
 
 @csrf_exempt
@@ -1107,192 +776,74 @@ def mail_window_api(request):
     if request.method not in ("GET", "POST"):
         return JsonResponse({"status": "error", "message": "Only GET or POST allowed"}, status=405)
 
-    days_raw = (request.GET.get("days") or "").strip()
-    try:
-        days = int(days_raw) if days_raw else MAIL_WINDOW_DEFAULT_DAYS
-    except ValueError:
-        return JsonResponse({"status": "error", "message": "days must be an integer"}, status=400)
+    days, days_error = parse_non_negative_int(request.GET.get("days"), MAIL_WINDOW_DEFAULT_DAYS)
+    if days_error:
+        return JsonResponse({"status": "error", "message": f"days {days_error}"}, status=400)
     days = max(1, min(days, MAIL_WINDOW_MAX_DAYS))
 
-    since_raw = (request.GET.get("since") or "").strip()
-    since_at = None
-    if since_raw:
-        try:
-            since_at = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
-        except ValueError:
-            return JsonResponse(
-                {"status": "error", "message": "Invalid since format. Use ISO-8601."},
-                status=400,
-            )
-        if since_at.tzinfo is None:
-            since_at = since_at.replace(tzinfo=dt_timezone.utc)
-        since_at = since_at.astimezone(dt_timezone.utc)
+    known_max_uid, uid_error = parse_non_negative_int(request.GET.get("max_uid"), 0)
+    if uid_error:
+        return JsonResponse({"status": "error", "message": f"max_uid {uid_error}"}, status=400)
+    client_uid_validity = (request.GET.get("uidvalidity") or "").strip()
 
     user = request.headers.get("X-LDAP-User")
     password = request.headers.get("X-LDAP-Pass")
     if not user or not password:
         return JsonResponse({"status": "error", "message": "LDAP credentials missing"}, status=401)
 
-    user_key = derive_user_key(user)
     mail = None
-
     try:
         today = current_ist_date()
         window_start_day = today - timedelta(days=days - 1)
-        window_start_at = datetime.combine(
-            window_start_day, time.min, tzinfo=IST_TIMEZONE
-        ).astimezone(dt_timezone.utc)
-
-        pruned_qs = EmailMessage.objects.filter(
-            user_key=user_key, received_at__lt=window_start_at
-        )
-        pruned_uids = list(pruned_qs.values_list("imap_uid", flat=True))
-        pruned_qs.delete()
-        DayCoverage.objects.filter(user_key=user_key, day__lt=window_start_day).delete()
-
-        state, _created = MailboxState.objects.get_or_create(user_key=user_key)
-        had_previous_sync = state.last_sync_at is not None
 
         mail = connect_to_iitb_imap()
         mail.login(user, password)
         mail.select("inbox", readonly=True)
 
         uid_validity = read_uid_validity(mail)
-        rescan = bool(
-            state.uid_validity and uid_validity and state.uid_validity != uid_validity
+        # A full resend when the extension has nothing yet, or the mailbox's UIDs were reset.
+        full = (
+            known_max_uid == 0
+            or not client_uid_validity
+            or (uid_validity and client_uid_validity != uid_validity)
         )
-        if rescan:
-            EmailMessage.objects.filter(user_key=user_key).delete()
-            DayCoverage.objects.filter(user_key=user_key).delete()
-        if uid_validity:
-            state.uid_validity = uid_validity
 
-        covered = set(
-            DayCoverage.objects.filter(
-                user_key=user_key, day__gte=window_start_day
-            ).values_list("day", flat=True)
-        )
-        window_days = [window_start_day + timedelta(days=offset) for offset in range(days)]
-        refresh_days = {today, today - timedelta(days=1)}
-        gap_days = [day for day in window_days if day not in covered and day not in refresh_days]
-        refresh_in_window = [day for day in window_days if day in refresh_days]
+        window_uids = sorted(imap_search_uids(mail, window_start_day), reverse=True)
+        unseen_uids = set(imap_search_uids(mail, window_start_day, unseen_only=True))
 
-        counters = {
-            "created": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "flag_updates": 0,
-            "gap_days": len(gap_days),
-            "refresh_days": len(refresh_in_window),
-        }
+        wanted = window_uids if full else [uid for uid in window_uids if uid > known_max_uid]
+        wanted = wanted[:MAIL_WINDOW_MAX_FETCH]
+        messages = fetch_messages_by_uid(mail, wanted)
 
-        for start_day, end_day in merge_contiguous_days(gap_days):
-            uids = imap_search_range(mail, start_day, end_day)
-            unseen_uids = set(imap_search_range(mail, start_day, end_day, unseen_only=True))
-            messages = fetch_messages_by_uid(mail, uids)
-
-            for uid in uids:
-                message_obj = messages.get(uid)
-                if message_obj is None:
-                    continue
-                record = build_window_record(message_obj, uid, uid not in unseen_uids)
-                counters[upsert_window_email(user_key, uid, record)] += 1
-
-            mark_days_covered(
-                user_key, start_day, end_day, count_window_emails_by_day(user_key, start_day, end_day)
-            )
-
-        for start_day, end_day in merge_contiguous_days(refresh_in_window):
-            uids = imap_search_range(mail, start_day, end_day)
-            unseen_uids = set(imap_search_range(mail, start_day, end_day, unseen_only=True))
-            known_uids = set(
-                EmailMessage.objects.filter(
-                    user_key=user_key, imap_uid__in=uids
-                ).values_list("imap_uid", flat=True)
-            )
-            new_uids = [uid for uid in uids if uid not in known_uids]
-
-            messages = fetch_messages_by_uid(mail, new_uids)
-            for uid in new_uids:
-                message_obj = messages.get(uid)
-                if message_obj is None:
-                    continue
-                record = build_window_record(message_obj, uid, uid not in unseen_uids)
-                counters[upsert_window_email(user_key, uid, record)] += 1
-
-            for row in EmailMessage.objects.filter(
-                user_key=user_key, imap_uid__in=known_uids
-            ):
-                should_be_read = row.imap_uid not in unseen_uids
-                if row.is_read != should_be_read:
-                    row.is_read = should_be_read
-                    row.save(update_fields=["is_read", "updated_at"])
-                    counters["flag_updates"] += 1
-
-            mark_days_covered(
-                user_key, start_day, end_day, count_window_emails_by_day(user_key, start_day, end_day)
-            )
-
-        window_qs = EmailMessage.objects.filter(user_key=user_key, received_at__gte=window_start_at)
-        total_in_window = window_qs.count()
-
-        full_sync = since_at is None or rescan or not had_previous_sync
-        rows = window_qs if full_sync else window_qs.filter(updated_at__gt=since_at)
-        emails = [serialize_window_email(row) for row in rows.order_by("-received_at")]
-
-        state.window_days = days
-        state.last_sync_at = timezone.now()
-        state.save(update_fields=["window_days", "last_sync_at", "uid_validity"])
-
-        stats = {
-            **counters,
-            "pruned": len(pruned_uids),
-            "total_in_window": total_in_window,
-        }
+        emails = []
+        for uid in wanted:
+            message_obj = messages.get(uid)
+            if message_obj is None:
+                continue
+            emails.append(build_window_record(message_obj, uid, uid in unseen_uids))
 
         print(
-            f"[API] mail_window_api user={user_key[:8]} days={days} "
-            f"full={full_sync} fetched={counters['created'] + counters['updated']} "
-            f"gap_days={counters['gap_days']} pruned={len(pruned_uids)}"
+            f"[API] mail_window_api days={days} full={bool(full)} "
+            f"in_window={len(window_uids)} fetched={len(emails)}"
         )
 
         return JsonResponse(
             {
                 "status": "success",
-                "full": full_sync,
+                "full": bool(full),
                 "days": days,
                 "window_start": window_start_day.isoformat(),
                 "window_end": today.isoformat(),
-                "synced_at": timezone.now().isoformat(),
-                "total_in_window": total_in_window,
+                "uid_validity": uid_validity,
+                "synced_at": datetime.now(dt_timezone.utc).isoformat(),
+                "window_uids": window_uids,
+                "unseen_uids": sorted(unseen_uids, reverse=True),
+                "total_in_window": len(window_uids),
                 "count": len(emails),
-                "pruned_uids": pruned_uids,
-                "stats": stats,
                 "emails": emails,
             }
         )
-
-    except ssl.SSLCertVerificationError as exc:
-        return JsonResponse(
-            {
-                "status": "error",
-                "message": (
-                    "Secure connection to IITB IMAP failed certificate verification. "
-                    f"Details: {exc}"
-                ),
-            },
-            status=502,
-        )
-    except ssl.SSLError as exc:
-        return JsonResponse(
-            {"status": "error", "message": f"Secure IMAP connection failed: {exc}"},
-            status=502,
-        )
     except Exception as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=500)
+        return imap_error_response(exc)
     finally:
-        if mail is not None:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+        safe_logout(mail)

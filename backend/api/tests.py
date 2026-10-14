@@ -1,7 +1,12 @@
-from datetime import date
+import json
+import re
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 
 import ssl
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
 from django.core.cache import cache
 from django.http import QueryDict
 from django.test import RequestFactory, SimpleTestCase
@@ -10,13 +15,12 @@ from django.test.utils import override_settings
 from .views import (
     build_secure_imap_ssl_context,
     build_email_record,
-    build_model_input,
+    daily_summary_api,
     extract_best_body,
-    extract_json_object,
-    fallback_overview,
     get_safe_fetch_query,
     is_allowed_extension_request,
     is_gemini_proxy_rate_limited,
+    mail_window_api,
     parse_requested_summary_date,
     resolve_proxy_request,
     sanitize_proxy_payload,
@@ -62,51 +66,6 @@ class DailySummaryHelpersTests(SimpleTestCase):
         self.assertEqual(record["status"], "unread")
         self.assertIn("Your interview is scheduled for Friday.", record["snippet"])
 
-    def test_build_model_input_keeps_each_email_visible(self):
-        records = [
-            {
-                "subject": "Subject A",
-                "sender": "Sender A",
-                "sender_email": "a@iitb.ac.in",
-                "status": "unread",
-                "source": "internal",
-                "received_label": "02 Apr 09:00",
-                "snippet": "Alpha",
-                "body_excerpt": "Alpha details",
-            },
-            {
-                "subject": "Subject B",
-                "sender": "Sender B",
-                "sender_email": "b@example.com",
-                "status": "read",
-                "source": "external",
-                "received_label": "02 Apr 10:00",
-                "snippet": "Beta",
-                "body_excerpt": "Beta details",
-            },
-        ]
-
-        corpus = build_model_input(records, char_limit=1200)
-
-        self.assertIn("Subject: Subject A", corpus)
-        self.assertIn("Subject: Subject B", corpus)
-        self.assertIn("Source: EXTERNAL", corpus)
-
-    def test_extract_json_object_handles_markdown_wrapped_json(self):
-        payload = """
-        ```json
-        {
-          "overview": "2 emails today",
-          "action_items": []
-        }
-        ```
-        """
-
-        parsed = extract_json_object(payload)
-
-        self.assertEqual(parsed["overview"], "2 emails today")
-        self.assertEqual(parsed["action_items"], [])
-
     def test_parse_requested_summary_date_accepts_iso_date(self):
         request = type("Request", (), {"GET": QueryDict("date=2026-04-01")})()
 
@@ -122,14 +81,6 @@ class DailySummaryHelpersTests(SimpleTestCase):
 
         self.assertIsNone(parsed_date)
         self.assertEqual(error, "Invalid date format. Use YYYY-MM-DD.")
-
-    def test_fallback_overview_includes_selected_date(self):
-        overview = fallback_overview(
-            {"total": 3, "unread": 1, "read": 2, "external_total": 1},
-            date(2026, 4, 1),
-        )
-
-        self.assertIn("2026-04-01", overview)
 
     def test_get_safe_fetch_query_uses_body_peek(self):
         self.assertEqual(get_safe_fetch_query(), "(BODY.PEEK[])")
@@ -175,7 +126,7 @@ class DailySummaryHelpersTests(SimpleTestCase):
             }
         )
 
-        self.assertEqual(model, "gemini-2.5-flash")
+        self.assertEqual(model, "gemini-3.8-flash")
         self.assertEqual(payload["contents"][0]["parts"][0]["text"], "Hello")
 
     @override_settings(GEMINI_PROXY_MAX_TEXT_CHARS=10, GEMINI_PROXY_MAX_OUTPUT_TOKENS=512)
@@ -199,6 +150,24 @@ class DailySummaryHelpersTests(SimpleTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["contents"][0]["parts"][0]["text"], "1234567890")
         self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 512)
+
+    def test_sanitize_proxy_payload_keeps_json_mode_and_temperature(self):
+        payload, error, _ = sanitize_proxy_payload(
+            {
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "responseMimeType": "application/json",
+                    "tools": ["not allowed"],
+                },
+            }
+        )
+
+        self.assertIsNone(error)
+        config = payload["generationConfig"]
+        self.assertEqual(config["temperature"], 0.3)
+        self.assertEqual(config["responseMimeType"], "application/json")
+        self.assertNotIn("tools", config)
 
     @override_settings(ALLOWED_EXTENSION_IDS=["test-extension-id"])
     def test_allowed_extension_request_accepts_matching_extension_id(self):
@@ -248,3 +217,148 @@ class DailySummaryHelpersTests(SimpleTestCase):
 
         self.assertFalse(is_gemini_proxy_rate_limited(request))
         self.assertTrue(is_gemini_proxy_rate_limited(request))
+
+
+class FakeImapConnection:
+    """Stand-in for imaplib.IMAP4_SSL that only accepts UID commands."""
+
+    def __init__(self, messages, unseen, uid_validity=b"777"):
+        # messages: {uid: (received date, raw bytes)}
+        self.messages = messages
+        self.unseen = set(unseen)
+        self.uid_validity = uid_validity
+        self.selected = None
+        self.fetched = []
+
+    def login(self, user, password):
+        return "OK", [b"logged in"]
+
+    def select(self, mailbox, readonly=False):
+        self.selected = (mailbox, readonly)
+        return "OK", [str(len(self.messages)).encode()]
+
+    def response(self, code):
+        return code, [self.uid_validity]
+
+    def uid(self, command, *args):
+        if command == "search":
+            criteria = args[-1]
+            since = re.search(r'SINCE "([^"]+)"', criteria).group(1)
+            since = datetime.strptime(since, "%d-%b-%Y").date()
+            before = re.search(r'BEFORE "([^"]+)"', criteria)
+            before = datetime.strptime(before.group(1), "%d-%b-%Y").date() if before else None
+            uids = [
+                uid for uid, (day, _raw) in self.messages.items()
+                if day >= since and (before is None or day < before)
+                and ("UNSEEN" not in criteria or uid in self.unseen)
+            ]
+            return "OK", [b" ".join(str(uid).encode() for uid in sorted(uids))]
+        if command == "fetch":
+            id_list, query = args
+            items = []
+            for uid in str(id_list).split(","):
+                self.fetched.append((int(uid), query))
+                raw = self.messages[int(uid)][1]
+                items += [(f"1 (UID {uid} BODY[] {{{len(raw)}}}".encode(), raw), b")"]
+            return "OK", items
+        raise AssertionError(f"Unexpected UID command {command}")
+
+    def search(self, *args):
+        raise AssertionError("Sequence-number SEARCH must not be used")
+
+    def fetch(self, *args):
+        raise AssertionError("Sequence-number FETCH must not be used")
+
+    def logout(self):
+        return "BYE", [b""]
+
+
+def make_raw_email(subject, sender, when):
+    message = EmailMessage()
+    message["From"] = sender
+    message["Subject"] = subject
+    message["Date"] = when.strftime("%a, %d %b %Y %H:%M:%S +0530")
+    message["Message-ID"] = f"<{subject.replace(' ', '-')}@test>"
+    message.set_content(f"Body of {subject}")
+    return message.as_bytes()
+
+
+class MailEndpointsTests(SimpleTestCase):
+    headers = {"X-LDAP-User": "24b0000", "X-LDAP-Pass": "token"}
+
+    def make_mailbox(self):
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        day = lambda n: now - timedelta(days=n)
+        return FakeImapConnection(
+            messages={
+                205: (day(0).date(), make_raw_email("Newest", "HR <hr@example.com>", day(0))),
+                150: (day(3).date(), make_raw_email("Three days", "Prof <p@iitb.ac.in>", day(3))),
+                40: (day(30).date(), make_raw_email("Too old", "Old <o@iitb.ac.in>", day(30))),
+            },
+            unseen=[205],
+        )
+
+    def call_window(self, mailbox, **params):
+        request = RequestFactory().get("/api/mail-window/", params, headers=self.headers)
+        with patch("api.views.connect_to_iitb_imap", return_value=mailbox):
+            response = mail_window_api(request)
+        return response.status_code, json.loads(response.content)
+
+    def test_daily_summary_returns_mails_with_uids_and_no_server_summary(self):
+        mailbox = self.make_mailbox()
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        request = RequestFactory().get("/api/daily-summary/", {"date": today}, headers=self.headers)
+
+        with patch("api.views.connect_to_iitb_imap", return_value=mailbox):
+            response = daily_summary_api(request)
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.content)
+        self.assertEqual([item["uid"] for item in payload["emails"]], [205])
+        self.assertEqual(payload["emails"][0]["status"], "unread")
+        self.assertEqual(payload["stats"]["total"], 1)
+        self.assertNotIn("overview", payload)
+        self.assertEqual(mailbox.selected, ("inbox", True))
+        self.assertTrue(all(query == "(BODY.PEEK[])" for _uid, query in mailbox.fetched))
+
+    def test_mail_window_first_sync_sends_whole_window_newest_first(self):
+        status, payload = self.call_window(self.make_mailbox(), days="15")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["full"])
+        self.assertEqual([item["uid"] for item in payload["emails"]], [205, 150])
+        self.assertEqual(payload["window_uids"], [205, 150])
+        self.assertEqual(payload["unseen_uids"], [205])
+        self.assertEqual(payload["uid_validity"], "777")
+        self.assertFalse(payload["emails"][0]["is_read"])
+
+    def test_mail_window_incremental_sync_fetches_only_newer_mails(self):
+        mailbox = self.make_mailbox()
+        status, payload = self.call_window(mailbox, days="15", max_uid="150", uidvalidity="777")
+
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["full"])
+        self.assertEqual([item["uid"] for item in payload["emails"]], [205])
+        self.assertEqual(payload["window_uids"], [205, 150])
+        self.assertEqual([uid for uid, _query in mailbox.fetched], [205])
+
+    def test_mail_window_resends_everything_when_uidvalidity_changes(self):
+        status, payload = self.call_window(
+            self.make_mailbox(), days="15", max_uid="205", uidvalidity="111"
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["full"])
+        self.assertEqual(len(payload["emails"]), 2)
+
+    def test_mail_window_requires_credentials(self):
+        request = RequestFactory().get("/api/mail-window/", {"days": "15"})
+        response = mail_window_api(request)
+        self.assertEqual(response.status_code, 401)
+
+    def test_mail_window_rejects_bad_max_uid(self):
+        request = RequestFactory().get(
+            "/api/mail-window/", {"max_uid": "abc"}, headers=self.headers
+        )
+        response = mail_window_api(request)
+        self.assertEqual(response.status_code, 400)
