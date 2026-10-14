@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+extension/models/all-MiniLM-L6-v2/
+backend/db.sqlite3

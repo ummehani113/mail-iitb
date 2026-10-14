@@ -4,11 +4,12 @@ const CHAT_TURN_LIMIT = 1500;
 const CHAT_TURNS_SENT = 6;
 
 const CHAT_SUGGESTIONS = [
-  "What's urgent in the last 3 days?",
-  "Summarise today's mail",
-  "Any deadlines coming up?",
-  "What's still unread?",
-  "Who emailed me this week?",
+  "Any deadlines in the next 7 days?",
+  "Any quizzes, exams or submissions coming up?",
+  "Did anyone ask me to reply or do something?",
+  "Any mails from professors or TAs?",
+  "What events or talks are happening this week?",
+  "Any internship, job or application openings?",
 ];
 
 let chatBusy = false;
@@ -26,16 +27,71 @@ function escapeChatHtml(value) {
     .replace(/>/g, "&gt;");
 }
 
-function formatChatText(text, uidById = {}) {
-  let html = escapeChatHtml(text);
-  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-  html = html.replace(/\[(E\d+)\]/g, (match, id) => {
+// Inline formatting for one escaped line: **bold**, `code`, [E12] chips, and
+// any leftover asterisks removed.
+function formatChatInline(html, uidById) {
+  let out = html;
+  out = out.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/__(.+?)__/g, "<strong>$1</strong>");
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/(^|[\s(])\*(?!\s)([^*]+?)\*(?=[\s).,;:!?]|$)/g, "$1$2"); // *italic* -> plain
+  out = out.replace(/\*/g, "");
+  out = out.replace(/\[(E\d+)\]/g, (match, id) => {
     const uid = uidById[String(Number(id.slice(1)))];
     if (!uid) return match;
     return `<span class="chat-citation" data-uid="${uid}" title="Open this email">${id}</span>`;
   });
-  return html;
+  // "[E3][E5]" -> small gap between chips
+  out = out.replace(/<\/span><span class="chat-citation"/g, '</span> <span class="chat-citation"');
+  return out;
+}
+
+// Turns Gemini's markdown-ish reply into clean HTML: paragraphs, bullet and
+// numbered lists, bold. Headings become bold lines. No stray asterisks.
+function formatChatText(text, uidById = {}) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const parts = [];
+  let list = null; // { type: "ul" | "ol", items: [] }
+
+  const flushList = () => {
+    if (!list) return;
+    parts.push(`<${list.type} class="chat-list">${list.items.map((item) => `<li>${item}</li>`).join("")}</${list.type}>`);
+    list = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      flushList();
+      continue;
+    }
+    const escaped = escapeChatHtml(line);
+    const bullet = escaped.match(/^(?:[-*•‣▪]|–)\s+(.*)$/);
+    const numbered = escaped.match(/^(\d{1,2})[.)]\s+(.*)$/);
+    const heading = escaped.match(/^#{1,6}\s+(.*)$/);
+
+    if (bullet) {
+      if (!list || list.type !== "ul") {
+        flushList();
+        list = { type: "ul", items: [] };
+      }
+      list.items.push(formatChatInline(bullet[1], uidById));
+    } else if (numbered) {
+      if (!list || list.type !== "ol") {
+        flushList();
+        list = { type: "ol", items: [] };
+      }
+      list.items.push(formatChatInline(numbered[2], uidById));
+    } else if (heading) {
+      flushList();
+      parts.push(`<p class="chat-heading"><strong>${formatChatInline(heading[1].replace(/\*\*/g, ""), uidById)}</strong></p>`);
+    } else {
+      flushList();
+      parts.push(`<p>${formatChatInline(escaped, uidById)}</p>`);
+    }
+  }
+  flushList();
+  return parts.join("");
 }
 
 function collectChatCitations(text, uidById) {
@@ -91,7 +147,9 @@ function renderChatBubble(role, html, options = {}) {
 
 function renderChatMessage(entry) {
   const uidById = entry.uids || {};
-  return renderChatBubble(entry.role === "user" ? "user" : "assistant", formatChatText(entry.text, uidById));
+  if (entry.role === "user") return renderChatBubble("user", escapeChatHtml(entry.text));
+  const note = entry.note ? `<p class="chat-note">${escapeChatHtml(entry.note)}</p>` : "";
+  return renderChatBubble("assistant", formatChatText(entry.text, uidById) + note);
 }
 
 async function renderChatHistory() {
@@ -107,7 +165,7 @@ async function renderChatHistory() {
   let fallbackMap = null;
   if (needsMap) {
     try {
-      const emails = await getMailWindowEmails();
+      const emails = (await getMailWindowEmails()).filter((email) => !email.sensitive);
       fallbackMap = {};
       emails.forEach((email, index) => {
         fallbackMap[index + 1] = email.uid;
@@ -151,14 +209,14 @@ function renderChatSuggestions() {
 
   const clear = document.createElement("button");
   clear.type = "button";
-  clear.className = "chat-suggestion";
+  clear.className = "chat-suggestion chat-clear";
   clear.textContent = "Clear chat";
   clear.onclick = async () => {
     await clearChatHistory();
     const messages = document.getElementById("chat-messages");
     if (messages) {
       messages.innerHTML =
-        '<div class="chat-bubble chat-assistant">Chat cleared. Ask me anything about your mail.</div>';
+        '<div class="chat-bubble chat-assistant"><p>Chat cleared. Ask me anything about your mail.</p></div>';
     }
     setChatStatus("");
   };
@@ -194,10 +252,51 @@ function requestOpenMail(uid) {
   });
 }
 
+// Sync new mails and update the local search vectors (runs in the background
+// worker; the panel opening, the Sync button and chat questions share one run).
+function requestPrepareInbox(force = false, forChat = false) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "PREPARE_INBOX", force, forChat }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { ok: false, error: "No response from the extension." });
+      });
+    } catch (err) {
+      resolve({ ok: false, error: err && err.message ? err.message : String(err) });
+    }
+  });
+}
+
+// The question as a MiniLM vector, made on this laptop. null if the model is unavailable.
+function requestQueryVector(text) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 15000);
+    try {
+      chrome.runtime.sendMessage({ type: "EMBED_QUERY", text }, (response) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError || !response || !response.ok) resolve(null);
+        else resolve(response.vector);
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
+}
+
+function formatSyncTime(iso) {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return "earlier";
+  return when.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "numeric", minute: "2-digit" });
+}
+
 async function openWebmailMessage(uid) {
   const numUid = Number(uid);
   if (!numUid || Number.isNaN(numUid)) {
-    setChatStatus("That citation has no mail link (older chat message) — ask the question again to get clickable ones.");
+    setChatStatus("That citation has no mail link (older chat message). Ask again to get clickable ones.");
     setTimeout(() => setChatStatus(""), 6000);
     return;
   }
@@ -227,25 +326,25 @@ async function handleChatSend() {
     history.push({ role: "user", text: question });
     await saveChatHistory(history);
 
-    const meta = await getMailWindowMeta();
-    if (!meta || !meta.syncedAt) {
-      setChatStatus("First sync — pulling your last 15 days of mail…");
-      const syncResult = await runMailWindowSync({ force: true });
-      if (!syncResult || !syncResult.ok) {
-        const message = (syncResult && syncResult.error) || "Could not sync your inbox window.";
-        renderChatBubble("assistant", escapeChatHtml(message));
-        setChatStatus("");
+    // Fetch new mails first (only if the last sync is over 5 minutes old), so
+    // the answer includes mail that just arrived.
+    thinking = renderChatBubble("assistant", "<p>Checking for new mail…</p>", { thinking: true });
+    const prep = await requestPrepareInbox(false, true);
+    let note = "";
+    if (!prep.ok) {
+      const meta = await getMailWindowMeta();
+      if (!meta || !meta.syncedAt) {
+        if (thinking) thinking.remove();
+        renderChatBubble("assistant", `<p>${escapeChatHtml(prep.error || "Could not sync your inbox.")}</p>`);
         return;
       }
-    } else {
-      runMailWindowSync({ force: false }).then((result) => {
-        if (result && result.ok && !result.skipped) refreshMailWindowStatus();
-      }).catch(() => {});
+      note = `Couldn't refresh, using mails synced at ${formatSyncTime(meta.syncedAt)}.`;
     }
 
-    thinking = renderChatBubble("assistant", "Thinking…", { thinking: true });
+    if (thinking) thinking.innerHTML = "<p>Thinking…</p>";
 
-    const context = await buildMailContext(question);
+    const queryVector = await requestQueryVector(question);
+    const context = await buildMailContext(question, { queryVector });
     const model = (await chatStorage(["selectedModel"])).selectedModel || "gemini-3.8-flash";
 
     const priorTurns = history.slice(0, -1).slice(-CHAT_TURNS_SENT);
@@ -258,32 +357,38 @@ async function handleChatSend() {
     const payload = {
       systemInstruction: { parts: [{ text: context.systemText }] },
       contents,
-      generationConfig: { temperature: 0.4, maxOutputTokens: 2048 },
+      generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
     };
 
     const answer = await sendChatPayload(payload, model, context.uidById || {});
 
     if (thinking) thinking.remove();
+    thinking = null;
 
     if (!answer.ok) {
-      renderChatBubble("assistant", escapeChatHtml(`⚠️ ${answer.error}`));
+      const hint = typeof geminiErrorHint === "function" ? geminiErrorHint(answer.error) : answer.error;
+      renderChatBubble("assistant", `<p class="chat-error">${escapeChatHtml(hint)}</p>`);
       setChatStatus("");
       return;
     }
 
     const uids = collectChatCitations(answer.text, answer.uidById || {});
-    renderChatBubble("assistant", formatChatText(answer.text, answer.uidById || {}));
+    const entry = { role: "assistant", text: answer.text, uids, note };
+    renderChatMessage({ ...entry, uids: answer.uidById || {} });
 
-    history.push({ role: "assistant", text: answer.text, uids });
+    history.push(entry);
     await saveChatHistory(history);
 
     const stats = context.stats || {};
-    setChatStatus(
-      `Context: ${stats.included || 0} of ${stats.total || 0} emails · ${stats.chars || 0} chars`
-    );
+    const searchNote = !stats.usedVectors
+      ? " (keyword search only)"
+      : prep.partial
+        ? " (still preparing older mails for search)"
+        : "";
+    setChatStatus(`Searched ${stats.total || 0} mails${searchNote}, read ${stats.included || 0} in full`);
   } catch (err) {
     if (thinking) thinking.remove();
-    renderChatBubble("assistant", escapeChatHtml(`⚠️ ${err && err.message ? err.message : err}`));
+    renderChatBubble("assistant", `<p class="chat-error">${escapeChatHtml(err && err.message ? err.message : err)}</p>`);
     setChatStatus("");
   } finally {
     chatBusy = false;

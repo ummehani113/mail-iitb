@@ -1,3 +1,7 @@
+// Mail filter, local mail store and the inbox prep job (sync + local search
+// vectors) are shared with the side panel.
+importScripts("sensitive.js", "store.js", "inbox-prep.js");
+
 const DEFAULT_BACKEND_BASE = "https://webmailextensionugac-260151192882.asia-south1.run.app";
 const sidePanelStateByTab = new Map();
 
@@ -103,56 +107,6 @@ chrome.runtime.onStartup.addListener(() => {
 
 let isAuthPending = false;
 let cachedToken = null;
-
-
-const CHAT_WINDOW_PATH = "chat-window.html";
-
-function chatWindowUrl() {
-  return chrome.runtime.getURL(CHAT_WINDOW_PATH);
-}
-
-async function findChatWindow() {
-  const windows = await chrome.windows.getAll({ populate: true });
-  const url = chatWindowUrl();
-  return windows.find((win) => (win.tabs || []).some((tab) => (tab.url || "") === url)) || null;
-}
-
-async function openOrFocusChatWindow() {
-  const existing = await findChatWindow();
-  if (existing) {
-    await chrome.windows.update(existing.id, { focused: true, state: "normal" });
-    return { ok: true, created: false, windowId: existing.id };
-  }
-
-  const width = 400;
-  const height = 660;
-  let left = null;
-  let top = null;
-
-  try {
-    const normalWindows = await chrome.windows.getAll({ windowTypes: ["normal"] });
-    const host = normalWindows.find((win) => win.focused) || normalWindows[0];
-    if (host && typeof host.left === "number" && typeof host.width === "number") {
-      left = Math.max(0, host.left + host.width - width - 12);
-      top = Math.max(0, host.top + 56);
-    }
-  } catch (err) {
-  }
-
-  const createOptions = {
-    url: chatWindowUrl(),
-    type: "popup",
-    width,
-    height,
-  };
-  if (left !== null) {
-    createOptions.left = left;
-    createOptions.top = top;
-  }
-
-  const created = await chrome.windows.create(createOptions);
-  return { ok: true, created: true, windowId: created && created.id };
-}
 
 
 
@@ -297,6 +251,22 @@ async function openMailInWebmail(uid, mbox = "INBOX") {
 
 
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (!req || req.target === "offscreen") return; // handled by offscreen.js
+
+  if (req.type === "PREPARE_INBOX") {
+    (req.forChat ? prepareInboxForChat() : prepareInbox({ force: !!req.force }))
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: (err && err.message) || String(err) }));
+    return true;
+  }
+
+  if (req.type === "EMBED_QUERY") {
+    embedQuery(req.text)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: (err && err.message) || String(err) }));
+    return true;
+  }
+
   if (req.type === "OPEN_MAIL") {
     openMailInWebmail(req.uid, req.mbox || "INBOX")
       .then((result) => sendResponse(result))
@@ -304,12 +274,16 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true;
   }
 
-  if (req.type === "OPEN_CHAT_WINDOW") {
-    openOrFocusChatWindow()
-      .then((result) => sendResponse(result))
-      .catch((err) =>
-        sendResponse({ ok: false, error: (err && err.message) || String(err) })
-      );
+  // The robot button on webmail opens the side panel with the chat expanded.
+  if (req.type === "OPEN_CHAT_PANEL" && sender.tab) {
+    const tabId = sender.tab.id;
+    markTabState(tabId, { opened: true, manuallyClosed: false });
+    chrome.storage.session.set({ focusChatAt: Date.now() }).catch(() => {});
+    applySidePanelOptions(tabId, true).catch((e) => console.error(e));
+    chrome.sidePanel
+      .open({ tabId })
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: (err && err.message) || String(err) }));
     return true;
   }
 

@@ -2,6 +2,7 @@ import json
 import re
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 
 import ssl
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from django.http import QueryDict
 from django.test import RequestFactory, SimpleTestCase
 from django.test.utils import override_settings
 
+from .sensitive import SENSITIVE_SUBJECT, protect_mail
 from .views import (
     build_secure_imap_ssl_context,
     build_email_record,
@@ -273,13 +275,13 @@ class FakeImapConnection:
         return "BYE", [b""]
 
 
-def make_raw_email(subject, sender, when):
+def make_raw_email(subject, sender, when, body=None):
     message = EmailMessage()
     message["From"] = sender
     message["Subject"] = subject
     message["Date"] = when.strftime("%a, %d %b %Y %H:%M:%S +0530")
     message["Message-ID"] = f"<{subject.replace(' ', '-')}@test>"
-    message.set_content(f"Body of {subject}")
+    message.set_content(body if body is not None else f"Body of {subject}")
     return message.as_bytes()
 
 
@@ -362,3 +364,69 @@ class MailEndpointsTests(SimpleTestCase):
         )
         response = mail_window_api(request)
         self.assertEqual(response.status_code, 400)
+
+
+SAMPLES_PATH = Path(__file__).resolve().parents[2] / "tests" / "sensitive_samples.json"
+
+
+class SensitiveMailTests(SimpleTestCase):
+    """Runs the shared sample set (also used by the extension's JS tests)."""
+
+    def test_shared_samples(self):
+        samples = json.loads(SAMPLES_PATH.read_text(encoding="utf-8"))["samples"]
+        for sample in samples:
+            with self.subTest(sample["name"]):
+                result = protect_mail(
+                    sample["subject"], sample["sender_name"], sample["sender_email"], sample["body"]
+                )
+                self.assertEqual(result["sensitive"] is not None, sample["expect"] == "hidden")
+                text = f"{result['subject']} {result['body']}"
+                for kept in sample.get("must_keep", []):
+                    self.assertIn(kept, text)
+                for removed in sample.get("must_remove", []):
+                    self.assertNotIn(removed, text)
+
+    def mailbox_with_otp(self):
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        return FakeImapConnection(
+            messages={
+                301: (now.date(), make_raw_email(
+                    "OTP for ASC login", "ASC <asc@iitb.ac.in>", now,
+                    body="Your OTP for ASC login is 482913. Valid for 10 minutes.")),
+                300: (now.date(), make_raw_email(
+                    "Quiz 2 on Friday", "Prof <p@iitb.ac.in>", now,
+                    body="Quiz 2 on 17 Oct at 8:30 AM in LH 101.")),
+            },
+            unseen=[301],
+        )
+
+    def test_daily_summary_never_returns_otp_text(self):
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        request = RequestFactory().get(
+            "/api/daily-summary/", {"date": today}, headers=MailEndpointsTests.headers
+        )
+        with patch("api.views.connect_to_iitb_imap", return_value=self.mailbox_with_otp()):
+            response = daily_summary_api(request)
+
+        raw = response.content.decode()
+        self.assertNotIn("482913", raw)
+        self.assertNotIn("_body", raw)
+        emails = {item["uid"]: item for item in json.loads(raw)["emails"]}
+        self.assertEqual(emails[301]["sensitive"], "otp")
+        self.assertEqual(emails[301]["subject"], SENSITIVE_SUBJECT)
+        self.assertIsNone(emails[300]["sensitive"])
+        self.assertIn("LH 101", emails[300]["snippet"])
+
+    def test_mail_window_never_returns_otp_text(self):
+        request = RequestFactory().get(
+            "/api/mail-window/", {"days": "15"}, headers=MailEndpointsTests.headers
+        )
+        with patch("api.views.connect_to_iitb_imap", return_value=self.mailbox_with_otp()):
+            response = mail_window_api(request)
+
+        raw = response.content.decode()
+        self.assertNotIn("482913", raw)
+        emails = {item["uid"]: item for item in json.loads(raw)["emails"]}
+        self.assertEqual(emails[301]["sensitive"], "otp")
+        self.assertEqual(emails[301]["body"], "")
+        self.assertIn("LH 101", emails[300]["body"])

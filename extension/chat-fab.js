@@ -69,13 +69,13 @@
 
     fab.addEventListener("click", () => {
       try {
-        chrome.runtime.sendMessage({ type: "OPEN_CHAT_WINDOW" }, (response) => {
+        chrome.runtime.sendMessage({ type: "OPEN_CHAT_PANEL" }, (response) => {
           if (chrome.runtime.lastError) {
             console.warn("[IITB Chat FAB]", chrome.runtime.lastError.message);
             return;
           }
           if (response && response.ok === false) {
-            console.warn("[IITB Chat FAB] could not open chat window:", response.error);
+            console.warn("[IITB Chat FAB] could not open the chat panel:", response.error);
           }
         });
       } catch (err) {

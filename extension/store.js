@@ -62,19 +62,36 @@ function openMailWindowDb() {
 
 function normalizeWindowEmail(row) {
   const receivedAt = new Date(row.received_at);
-  return {
+  const base = {
     uid: Number(row.uid),
     messageId: row.message_id || "",
     receivedAt: Number.isNaN(receivedAt.getTime()) ? "" : receivedAt.toISOString(),
     receivedLabel: row.received_label || "",
     senderName: row.sender_name || "",
     senderEmail: row.sender_email || "",
-    subject: row.subject || "",
-    body: row.body || "",
-    snippet: row.snippet || "",
-    excerpt: row.excerpt || "",
     isRead: !!row.is_read,
     source: row.source || "internal",
+  };
+
+  // The server already hides OTP / login / bank mails; check again so nothing
+  // sensitive is ever stored here, even from an older server.
+  const checked = protectMail({
+    subject: row.subject || "",
+    senderName: base.senderName,
+    senderEmail: base.senderEmail,
+    body: [row.body, row.snippet, row.excerpt].filter(Boolean).join("\n"),
+  });
+  const reason = row.sensitive || checked.sensitive;
+  if (reason) {
+    return { ...base, sensitive: reason, subject: SENSITIVE_SUBJECT, body: "", snippet: SENSITIVE_NOTE, excerpt: SENSITIVE_NOTE };
+  }
+  return {
+    ...base,
+    sensitive: null,
+    subject: redactSecrets(row.subject || ""),
+    body: redactSecrets(row.body || ""),
+    snippet: redactSecrets(row.snippet || ""),
+    excerpt: redactSecrets(row.excerpt || ""),
   };
 }
 
@@ -147,6 +164,22 @@ async function applyMailWindowSync(payload, metaExtra = {}) {
     ...metaExtra,
   });
 
+  await idbTxDone(tx);
+}
+
+// Saves MiniLM vectors next to their mails. Rows that disappeared meanwhile
+// (left the window) are skipped.
+async function saveMailVectors(items, model) {
+  const db = await openMailWindowDb();
+  const tx = db.transaction(MAIL_WINDOW_EMAILS, "readwrite");
+  const store = tx.objectStore(MAIL_WINDOW_EMAILS);
+  for (const { uid, vector } of items) {
+    const request = store.get(Number(uid));
+    request.onsuccess = () => {
+      const row = request.result;
+      if (row && vector) store.put({ ...row, vec: Float32Array.from(vector), vecModel: model });
+    };
+  }
   await idbTxDone(tx);
 }
 

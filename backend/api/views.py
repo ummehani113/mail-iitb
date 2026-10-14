@@ -16,6 +16,8 @@ from django.core.cache import cache
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
+from .sensitive import SENSITIVE_NOTE, SENSITIVE_SUBJECT, protect_mail
+
 DEFAULT_PROXY_MODEL = "gemini-3.8-flash"
 SUPPORTED_PROXY_MODELS = {
     "gemini-2.5-flash",
@@ -195,8 +197,16 @@ def build_email_record(message, is_unread, uid=None):
 
     subject = decode_mime_header(message.get("Subject", "")) or "(No subject)"
     body = extract_best_body(message)
-    fallback_text = f"Subject: {subject}. From: {sender_name}."
-    snippet_source = body or fallback_text
+
+    # OTPs, login codes, reset links and bank alerts never leave the server.
+    protected = protect_mail(subject, sender_name, sender_email, body)
+    if protected["sensitive"]:
+        subject, snippet, excerpt = SENSITIVE_SUBJECT, SENSITIVE_NOTE, SENSITIVE_NOTE
+    else:
+        subject, body = protected["subject"], protected["body"]
+        snippet_source = body or f"Subject: {subject}. From: {sender_name}."
+        snippet = build_snippet(snippet_source, 320)
+        excerpt = build_snippet(snippet_source, 900)
 
     return {
         "uid": uid,
@@ -206,8 +216,10 @@ def build_email_record(message, is_unread, uid=None):
         "status": "unread" if is_unread else "read",
         "source": classify_sender(sender_email),
         "received_label": format_received_label(message.get("Date", "")),
-        "snippet": build_snippet(snippet_source, 320),
-        "body_excerpt": build_snippet(snippet_source, 900),
+        "snippet": snippet,
+        "body_excerpt": excerpt,
+        "sensitive": protected["sensitive"],
+        "_body": body if not protected["sensitive"] else "",
     }
 
 
@@ -685,7 +697,9 @@ def daily_summary_api(request):
             message_obj = messages.get(uid)
             if message_obj is None:
                 continue
-            emails.append(build_email_record(message_obj, uid in unread_uids, uid=uid))
+            record = build_email_record(message_obj, uid in unread_uids, uid=uid)
+            record.pop("_body", None)
+            emails.append(record)
 
         return JsonResponse(
             {
@@ -735,7 +749,7 @@ def parse_message_datetime(raw_date):
 
 def build_window_record(message_obj, uid, is_unread):
     record = build_email_record(message_obj, is_unread, uid=uid)
-    body = clean_extracted_text(extract_best_body(message_obj))[:MAIL_WINDOW_BODY_LIMIT]
+    body = clean_extracted_text(record.pop("_body", ""))[:MAIL_WINDOW_BODY_LIMIT]
     received_at = (
         parse_message_datetime(message_obj.get("Date", ""))
         or datetime.now(dt_timezone.utc)
@@ -755,6 +769,7 @@ def build_window_record(message_obj, uid, is_unread):
         "excerpt": record["body_excerpt"][:1000],
         "is_read": not is_unread,
         "source": record["source"],
+        "sensitive": record["sensitive"],
     }
 
 

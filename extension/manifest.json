@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Mail IITB",
-  "version": "3.3",
+  "version": "3.4",
   "icons": {
     "16": "Icons/icon_16.png",
     "32": "Icons/icon_32.png",
@@ -22,7 +22,8 @@
     "storage",
     "identity",
     "sidePanel",
-    "notifications"
+    "notifications",
+    "offscreen"
   ],
   "host_permissions": [
     "*://webmail.iitb.ac.in/*",
@@ -35,6 +36,9 @@
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   },
   "side_panel": {
     "default_path": "popup.html"

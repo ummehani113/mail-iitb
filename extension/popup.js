@@ -33,18 +33,47 @@ async function buildBackendUrl(path) {
 }
 
 
-async function refreshMailWindowStatus() {
+const INBOX_PREP_KEY = "inboxPrepState";
+
+function formatPrepTime(iso) {
+  const when = new Date(iso);
+  if (!iso || Number.isNaN(when.getTime())) return "";
+  return when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+// One line under "Chat with my inbox" showing where the local copy stands.
+async function refreshMailWindowStatus(state) {
   const statusEl = document.getElementById("chat-sync-status");
   if (!statusEl || typeof getMailWindowMeta !== "function") return;
 
+  if (!state) {
+    const stored = await chrome.storage.session.get([INBOX_PREP_KEY]).catch(() => ({}));
+    state = (stored && stored[INBOX_PREP_KEY]) || null;
+  }
   const meta = await getMailWindowMeta();
+
+  if (state && state.phase === "syncing") {
+    statusEl.textContent = meta && meta.syncedAt ? "Checking for new mail…" : "Fetching your last 15 days of mail…";
+    return;
+  }
+  if (state && state.phase === "embedding") {
+    statusEl.textContent = `Preparing your inbox for search… ${state.done}/${state.total}`;
+    return;
+  }
+  if (state && state.phase === "error") {
+    statusEl.textContent = meta && meta.syncedAt
+      ? `Couldn't refresh (${state.error}). Using mails synced at ${formatPrepTime(meta.syncedAt)}.`
+      : state.error;
+    return;
+  }
   if (!meta || !meta.syncedAt) {
     statusEl.textContent = `Not synced yet · via ${await currentBackendLabel()}`;
     return;
   }
   const count = typeof meta.count === "number" ? meta.count : "?";
+  const searchNote = state && state.embedError ? " · keyword search only" : "";
   statusEl.textContent =
-    `${count} mails stored · ${meta.windowStart} → ${meta.windowEnd} · via ${await currentBackendLabel()}`;
+    `${count} mails ready · synced ${formatPrepTime(meta.syncedAt)}${searchNote} · via ${await currentBackendLabel()}`;
 }
 
 async function persistBackendUrlFromInput() {
@@ -81,49 +110,34 @@ async function currentBackendLabel() {
   return base ? base.replace(/^https?:\/\//, "").replace(/\/$/, "") : "auto-detect";
 }
 
+// Sync + local search vectors run in the background worker (inbox-prep.js),
+// so they keep going if the panel is busy and are shared with chat questions.
 async function runMailWindowSync(options = {}) {
-  const statusEl = document.getElementById("chat-sync-status");
   const btn = document.getElementById("syncWindowBtn");
   const force = options.force !== false;
 
   await persistBackendUrlFromInput();
-
   if (btn) {
     btn.disabled = true;
     btn.textContent = "Syncing…";
   }
-  if (statusEl) statusEl.textContent = "Scraping the 15-day window…";
-
   try {
-    const result = await syncMailWindow({ force });
-
-    if (!result.ok) {
-      if (statusEl) statusEl.textContent = result.error;
-      return result;
-    }
-
-    if (result.skipped) {
-      if (statusEl) statusEl.textContent = "Already synced in the last 5 minutes.";
-      return result;
-    }
-
-    const meta = result.meta || {};
-    const count = typeof meta.count === "number" ? meta.count : "?";
-    if (statusEl) {
-      statusEl.textContent = `${count} mails stored · ${meta.windowStart} → ${meta.windowEnd}` +
-        (result.full ? "" : " (updated)") +
-        ` · via ${await currentBackendLabel()}`;
-    }
+    const result = await requestPrepareInbox(force);
+    await refreshMailWindowStatus();
     return result;
-  } catch (err) {
-    if (statusEl) statusEl.textContent = `Sync failed: ${err && err.message ? err.message : err}`;
-    return { ok: false, error: String(err) };
   } finally {
     if (btn) {
       btn.disabled = false;
       btn.textContent = "Sync 15 days";
     }
   }
+}
+
+// Called when the panel opens: get the inbox ready before the first question.
+async function autoPrepareInbox() {
+  const creds = await new Promise((resolve) => chrome.storage.local.get(["ldap_user", "ldap_pass"], resolve));
+  if (!creds || !creds.ldap_user || !creds.ldap_pass) return;
+  requestPrepareInbox(false).then(() => refreshMailWindowStatus());
 }
 
 function sendToGemini(prompt, callback) {
@@ -437,6 +451,10 @@ function handleLDAPLogout() {
   }
 
   clearDailySummaryCache();
+  // The local mail copy, search vectors and chat belong to this login.
+  if (typeof clearMailWindow === "function") clearMailWindow().then(() => refreshMailWindowStatus());
+  if (typeof clearChatHistory === "function") clearChatHistory();
+  chrome.storage.session.remove(["inboxPrepState"]).catch(() => {});
   chrome.storage.local.remove(['ldap_user', 'ldap_pass'], () => {
     const logoutStatus = document.getElementById('logout-status');
     if (chrome.runtime.lastError) {
@@ -713,7 +731,31 @@ async function fetchDailyMails(date, creds) {
   if (!Array.isArray(data.emails)) {
     throw new Error("The server is running an older version without mail details. Restart it with the updated backend.");
   }
+  data.emails = data.emails.map(protectDailyMail);
   return data;
+}
+
+// The server already hides OTP / login / bank mails; this repeats the check
+// here so nothing slips through from an older server.
+function protectDailyMail(mail) {
+  const text = [mail.snippet, mail.body_excerpt].filter(Boolean).join("\n");
+  const checked = protectMail({
+    subject: mail.subject,
+    senderName: mail.sender,
+    senderEmail: mail.sender_email,
+    body: text,
+  });
+  const reason = mail.sensitive || checked.sensitive;
+  if (reason) {
+    return { ...mail, sensitive: reason, subject: SENSITIVE_SUBJECT, snippet: SENSITIVE_NOTE, body_excerpt: SENSITIVE_NOTE };
+  }
+  return {
+    ...mail,
+    sensitive: null,
+    subject: redactSecrets(mail.subject || ""),
+    snippet: redactSecrets(mail.snippet || ""),
+    body_excerpt: redactSecrets(mail.body_excerpt || ""),
+  };
 }
 
 function buildDailyPrompt(date, emails) {
@@ -817,10 +859,15 @@ function normalizeDailyAi(parsed, emails) {
   if (!parsed || typeof parsed !== "object") return null;
 
   const summaries = {};
+  const summariesByUid = {};
   (Array.isArray(parsed.emails) ? parsed.emails : []).forEach((entry) => {
     const id = Number(entry && entry.id);
     const text = cleanAiText(entry && entry.summary);
-    if (Number.isInteger(id) && id >= 1 && id <= emails.length && text) summaries[id] = text;
+    if (Number.isInteger(id) && id >= 1 && id <= emails.length && text) {
+      summaries[id] = text;
+      const uid = validUid(emails[id - 1].uid);
+      if (uid) summariesByUid[uid] = text;
+    }
   });
 
   const actions = (Array.isArray(parsed.action_items) ? parsed.action_items : [])
@@ -848,6 +895,7 @@ function normalizeDailyAi(parsed, emails) {
     unreadDigest: normalizeDigest(parsed.unread_digest),
     readDigest: normalizeDigest(parsed.read_digest),
     summaries,
+    summariesByUid,
   };
 }
 
@@ -929,11 +977,13 @@ function renderDigestPanel(title, cls, groups, emptyText) {
     </div>`;
 }
 
-function renderDailyMailCards(emails, summaries) {
+function renderDailyMailCards(emails, ai) {
   if (!emails.length) return "";
+  const byUid = ai.summariesByUid;
   const cards = emails.map((mail, index) => {
-    const summary = summaries[index + 1];
     const clean = validUid(mail.uid);
+    // Older cached summaries are keyed by position; newer ones by mail uid.
+    const summary = byUid ? byUid[clean] : (ai.summaries || {})[index + 1];
     return `
       <div class="daily-email-card${clean ? " is-link" : ""}"${linkAttrs(mail.uid)}>
         <div class="daily-email-topline">
@@ -947,9 +997,11 @@ function renderDailyMailCards(emails, summaries) {
             [`status-${mail.status || "read"}`, mail.status || "read"],
           ])}
         </div>
-        ${summary
-          ? `<p class="daily-email-summary">${escapeHtml(summary)}</p>`
-          : `<p class="daily-email-summary is-missing">No summary returned for this mail.</p>`}
+        ${mail.sensitive
+          ? `<p class="daily-email-summary is-sensitive">Hidden: this looks like an OTP, login code or bank alert, so it was not sent to Gemini. Open it in webmail to read it.</p>`
+          : summary
+            ? `<p class="daily-email-summary">${escapeHtml(summary)}</p>`
+            : `<p class="daily-email-summary is-missing">No summary returned for this mail.</p>`}
         ${clean ? `<span class="daily-open-hint">Open mail &rarr;</span>` : ""}
       </div>`;
   }).join("");
@@ -985,7 +1037,7 @@ function renderDailyResult(mailsPayload, ai, generatedAt) {
         ${renderDigestPanel("Unread mails", "unread-summary-panel", ai.unreadDigest, "No unread mails.")}
         ${renderDigestPanel("Read mails", "read-summary-panel", ai.readDigest, "No read mails.")}
       </div>
-      ${renderDailyMailCards(emails, ai.summaries)}
+      ${renderDailyMailCards(emails, ai)}
     </div>`;
   result.style.display = "block";
 }
@@ -1044,10 +1096,12 @@ async function generateDailySummary({ reuseMails = false } = {}) {
       dailyLastMails = { date, payload: mailsPayload };
     }
 
-    const emails = mailsPayload.emails || [];
+    // Sensitive mails (OTP, login codes, bank alerts) are shown as hidden cards
+    // and never sent to Gemini.
+    const emails = (mailsPayload.emails || []).filter((mail) => !mail.sensitive);
     if (!emails.length) {
       setDailyStatus("");
-      renderDailyResult(mailsPayload, { actions: [], unreadDigest: [], readDigest: [], summaries: {} }, null);
+      renderDailyResult(mailsPayload, { actions: [], unreadDigest: [], readDigest: [], summaries: {}, summariesByUid: {} }, null);
       return;
     }
 
@@ -1109,6 +1163,7 @@ function setDailyExpanded(expanded) {
   const btn = document.getElementById("dailyExpandBtn");
   if (!section || !btn) return;
 
+  if (expanded && document.body.classList.contains("chat-expanded")) setChatExpanded(false);
   document.body.classList.toggle("daily-expanded", expanded);
   if (expanded) section.classList.add("active");
   btn.textContent = expanded ? "Collapse" : "Expand";
@@ -1211,6 +1266,14 @@ function stopRecognitionUI(resetMessage = true) {
   }
 }
 
+function openedMailError(resp) {
+  if (resp?.error === "mail_only_on_webmail") return "Open IITB webmail to use this feature";
+  if (resp?.error === "sensitive_mail") {
+    return "This mail looks like an OTP, login code or bank alert, so it won't be sent to Gemini.";
+  }
+  return "No mail detected";
+}
+
 async function getOpenedMail(cb) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) {
@@ -1223,9 +1286,24 @@ async function getOpenedMail(cb) {
     return;
   }
 
+  // OTP / login / bank mails are never sent to Gemini; clear secrets in
+  // normal mails (typed passwords, card or Aadhaar numbers) are blanked.
+  const deliver = (response) => {
+    if (!response || !response.ok || !response.mail) {
+      cb(response);
+      return;
+    }
+    const checked = protectMail({ body: response.mail.body || "" });
+    if (checked.sensitive) {
+      cb({ ok: false, error: "sensitive_mail" });
+      return;
+    }
+    cb({ ...response, mail: { ...response.mail, body: checked.body } });
+  };
+
   chrome.tabs.sendMessage(tab.id, { type: "GET_OPENED_MAIL" }, (response) => {
     if (!chrome.runtime.lastError) {
-      cb(response);
+      deliver(response);
       return;
     }
 
@@ -1237,7 +1315,7 @@ async function getOpenedMail(cb) {
           return;
         }
 
-        chrome.tabs.sendMessage(tab.id, { type: "GET_OPENED_MAIL" }, cb);
+        chrome.tabs.sendMessage(tab.id, { type: "GET_OPENED_MAIL" }, deliver);
       }
     );
   });
@@ -1250,7 +1328,7 @@ function actionSummarize() {
 
   getOpenedMail(resp => {
     if (!resp || !resp.ok) {
-      showMessage(resp?.error === "mail_only_on_webmail" ? "Open IITB webmail to use this feature" : "No mail detected", "summary", true);
+      showMessage(openedMailError(resp), "summary", true);
       return;
     }
 
@@ -1389,7 +1467,7 @@ function actionCalendarOnly() {
 
   getOpenedMail(resp => {
     if (!resp || !resp.ok) {
-      showMessage(resp?.error === "mail_only_on_webmail" ? "Open IITB webmail to use this feature" : "No mail detected", "calendar", true);
+      showMessage(openedMailError(resp), "calendar", true);
       return;
     }
 
@@ -1495,7 +1573,7 @@ function actionReply() {
 
   getOpenedMail(resp => {
     if (!resp || !resp.ok) {
-      showMessage(resp?.error === "mail_only_on_webmail" ? "Open IITB webmail to use this feature" : "No mail detected", "reply", true);
+      showMessage(openedMailError(resp), "reply", true);
       return;
     }
 
@@ -1775,6 +1853,53 @@ function renderCompose(fullText, subject, body) {
 }
 
 
+/* -------------------- Chat: expand to the whole panel -------------------- */
+
+function setChatExpanded(expanded) {
+  const section = document.getElementById("chat-section");
+  const btn = document.getElementById("chatExpandBtn");
+  if (!section) return;
+  if (expanded && document.body.classList.contains("daily-expanded")) setDailyExpanded(false);
+
+  document.body.classList.toggle("chat-expanded", expanded);
+  if (expanded) section.classList.add("active");
+  if (btn) {
+    btn.textContent = expanded ? "Collapse" : "Expand";
+    btn.setAttribute("aria-expanded", String(expanded));
+  }
+  const messages = document.getElementById("chat-messages");
+  if (messages) messages.scrollTop = messages.scrollHeight;
+  if (expanded) {
+    window.scrollTo(0, 0);
+    document.getElementById("chatInput")?.focus();
+  } else {
+    section.scrollIntoView({ block: "nearest" });
+  }
+}
+
+// The robot button on webmail asks for the chat: open it expanded.
+function focusChatFromButton(at) {
+  if (!at || Date.now() - at > 15000) return;
+  setChatExpanded(true);
+}
+
+function initChatExpand() {
+  const btn = document.getElementById("chatExpandBtn");
+  if (btn) {
+    btn.addEventListener("click", () => setChatExpanded(!document.body.classList.contains("chat-expanded")));
+  }
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.body.classList.contains("chat-expanded")) setChatExpanded(false);
+  });
+
+  chrome.storage.session.get(["focusChatAt"]).then((data) => focusChatFromButton(data && data.focusChatAt)).catch(() => {});
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "session" && changes.focusChatAt) focusChatFromButton(changes.focusChatAt.newValue);
+    if (area === "session" && changes[INBOX_PREP_KEY]) refreshMailWindowStatus(changes[INBOX_PREP_KEY].newValue);
+    if (area === "local" && changes.ldap_pass && changes.ldap_pass.newValue) autoPrepareInbox();
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   updateAuthUI();
   const urlParams = new URLSearchParams(window.location.search);
@@ -2006,17 +2131,9 @@ document.addEventListener("DOMContentLoaded", () => {
     syncWindowBtn.onclick = () => runMailWindowSync({ force: true });
   }
 
-  const openChatWindowBtn = document.getElementById("openChatWindowBtn");
-  if (openChatWindowBtn) {
-    openChatWindowBtn.onclick = () => {
-      chrome.runtime.sendMessage({ type: "OPEN_CHAT_WINDOW" }, (result) => {
-        if (!result || !result.ok) {
-          showMessage("Could not open the chat window.", "setup", true);
-        }
-      });
-    };
-  }
   refreshMailWindowStatus();
+  initChatExpand();
+  autoPrepareInbox();
 
   if (typeof initChat === "function") initChat();
   initDailySummary();
