@@ -1539,6 +1539,20 @@ body.daily-expanded #daily-section .daily-structured-list li {
     body.daily-expanded #daily-section .daily-summary-panel { flex: 1; min-width: 0; }
 }
 
+#openChatWindowBtn {
+    padding: 9px 12px;
+    border-radius: 12px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #111827;
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+#openChatWindowBtn:hover { background: #f1f5f9; }
+
 /* Theme toggle in the header */
 .theme-toggle {
     display: inline-flex;
@@ -1579,6 +1593,13 @@ body.theme-dark .theme-toggle { background: #1e293b; border-color: #475569; colo
 body.theme-dark .theme-toggle:hover { background: #334155; }
 body.theme-dark .theme-toggle .icon-moon { display: none; }
 body.theme-dark .theme-toggle .icon-sun { display: inline; }
+
+body.theme-dark #daily-section { --daily-bg: #111c2e; }
+body.theme-dark.daily-expanded #daily-section .accordion-content,
+body.theme-dark.daily-expanded #daily-section { background-color: #0f172a; --daily-bg: #0f172a; }
+
+/* logos have white backgrounds: give them a tidy white tile in dark mode */
+body.theme-dark .header img { background: #ffffff; border-radius: 6px; padding: 2px 4px; }
 
 body.theme-dark .header,
 body.theme-dark header.header {
