@@ -1,0 +1,507 @@
+const DEFAULT_BACKEND_BASE = "https://webmailextensionugac-260151192882.asia-south1.run.app";
+const sidePanelStateByTab = new Map();
+
+function normalizeBackendBase(value) {
+  const trimmed = (value || "").trim().replace(/\/+$/, "");
+  return trimmed || DEFAULT_BACKEND_BASE;
+}
+
+async function resolveBackendBase() {
+  try {
+    const data = await chrome.storage.local.get(["backendBaseUrl"]);
+    return normalizeBackendBase(data.backendBaseUrl);
+  } catch (err) {
+    return DEFAULT_BACKEND_BASE;
+  }
+}
+
+async function buildBackendUrl(path) {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const base = await resolveBackendBase();
+  return `${base}${normalizedPath}`;
+}
+
+function getSidePanelState(tabId) {
+  return sidePanelStateByTab.get(tabId) || { autoOpened: false, opened: false, manuallyClosed: false };
+}
+
+function setSidePanelState(tabId, nextState) {
+  sidePanelStateByTab.set(tabId, nextState);
+}
+
+function clearSidePanelState(tabId) {
+  sidePanelStateByTab.delete(tabId);
+}
+
+function isWebmailUrl(url = "") {
+  return typeof url === "string" && url.includes("webmail.iitb.ac.in");
+}
+
+function applySidePanelOptions(tabId, enabled) {
+  return chrome.sidePanel.setOptions({
+    tabId,
+    path: "popup.html",
+    enabled,
+  });
+}
+
+function disableDefaultSidePanel() {
+  return chrome.sidePanel.setOptions({
+    enabled: false,
+  });
+}
+
+function markTabState(tabId, updates) {
+  const current = getSidePanelState(tabId);
+  setSidePanelState(tabId, {
+    ...current,
+    ...updates,
+  });
+}
+
+async function syncTabSidePanel(tabId, url = "") {
+  const state = getSidePanelState(tabId);
+  await applySidePanelOptions(tabId, state.opened === true);
+}
+
+disableDefaultSidePanel().catch((error) => console.error(error));
+
+chrome.runtime.onInstalled.addListener(() => {
+  disableDefaultSidePanel().catch((error) => console.error(error));
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  disableDefaultSidePanel().catch((error) => console.error(error));
+});
+
+let isAuthPending = false;
+let cachedToken = null;
+
+
+const CHAT_WINDOW_PATH = "chat-window.html";
+
+function chatWindowUrl() {
+  return chrome.runtime.getURL(CHAT_WINDOW_PATH);
+}
+
+async function findChatWindow() {
+  const windows = await chrome.windows.getAll({ populate: true });
+  const url = chatWindowUrl();
+  return windows.find((win) => (win.tabs || []).some((tab) => (tab.url || "") === url)) || null;
+}
+
+async function openOrFocusChatWindow() {
+  const existing = await findChatWindow();
+  if (existing) {
+    await chrome.windows.update(existing.id, { focused: true, state: "normal" });
+    return { ok: true, created: false, windowId: existing.id };
+  }
+
+  const width = 400;
+  const height = 660;
+  let left = null;
+  let top = null;
+
+  try {
+    const normalWindows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    const host = normalWindows.find((win) => win.focused) || normalWindows[0];
+    if (host && typeof host.left === "number" && typeof host.width === "number") {
+      left = Math.max(0, host.left + host.width - width - 12);
+      top = Math.max(0, host.top + 56);
+    }
+  } catch (err) {
+  }
+
+  const createOptions = {
+    url: chatWindowUrl(),
+    type: "popup",
+    width,
+    height,
+  };
+  if (left !== null) {
+    createOptions.left = left;
+    createOptions.top = top;
+  }
+
+  const created = await chrome.windows.create(createOptions);
+  return { ok: true, created: true, windowId: created && created.id };
+}
+
+
+chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req.type === "OPEN_CHAT_WINDOW") {
+    openOrFocusChatWindow()
+      .then((result) => sendResponse(result))
+      .catch((err) =>
+        sendResponse({ ok: false, error: (err && err.message) || String(err) })
+      );
+    return true;
+  }
+
+  if (req.type === "OPEN_SIDEBAR" && sender.tab) {
+    const state = getSidePanelState(sender.tab.id);
+    if (state.autoOpened || state.manuallyClosed) {
+      return;
+    }
+
+    markTabState(sender.tab.id, {
+      autoOpened: true,
+      opened: true,
+      manuallyClosed: false,
+    });
+
+    applySidePanelOptions(sender.tab.id, true).catch((e) => console.error(e));
+    chrome.sidePanel.open({ tabId: sender.tab.id })
+      .catch((e) => console.error(e));
+    return;
+  }
+
+  if (req.type === "GEMINI_SUMMARY") {
+    handleGeminiProxy(req, sendResponse);
+    return true;
+  }
+
+  if (req.type === "ADD_CALENDAR_EVENT") {
+    handleCalendarFlow(req.eventData, req.cardId);
+  }
+
+  if (req.type === "UPDATE_CALENDAR_EVENT") {
+    handleCalendarFlow(req.eventData, req.cardId, req.eventId);
+  }
+
+  if (req.type === "SWITCH_GOOGLE_ACCOUNT") {
+    cachedToken = null;
+    chrome.storage.local.remove('sessionToken', () => {
+      handleCalendarFlow({}, null, null, true);
+    });
+  }
+
+});
+
+chrome.action.onClicked.addListener((tab) => {
+  if (!tab?.id) {
+    return;
+  }
+
+  markTabState(tab.id, {
+    opened: true,
+    manuallyClosed: false,
+  });
+
+  applySidePanelOptions(tab.id, true).catch((e) => console.error(e));
+  chrome.sidePanel.open({ tabId: tab.id }).catch((e) => console.error(e));
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (!tab.url) {
+    return;
+  }
+
+  await syncTabSidePanel(tabId, tab.url);
+});
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    await syncTabSidePanel(tabId, tab.url);
+  } catch (error) {
+    console.error(error);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearSidePanelState(tabId);
+});
+
+if (chrome.sidePanel.onOpened) {
+  chrome.sidePanel.onOpened.addListener((info) => {
+    if (Number.isInteger(info.tabId)) {
+      markTabState(info.tabId, { opened: true });
+    }
+  });
+}
+
+if (chrome.sidePanel.onClosed) {
+  chrome.sidePanel.onClosed.addListener((info) => {
+    if (Number.isInteger(info.tabId)) {
+      markTabState(info.tabId, {
+        opened: false,
+        manuallyClosed: true,
+      });
+      applySidePanelOptions(info.tabId, false).catch((error) => console.error(error));
+    }
+  });
+}
+
+
+const RETIRED_GEMINI_MODELS = {
+  "gemini-2.5-flash": "gemini-3.8-flash",
+  "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+};
+const FALLBACK_GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
+const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+
+function resolveGeminiModel(model) {
+  const chosen = model || DEFAULT_GEMINI_MODEL;
+  return RETIRED_GEMINI_MODELS[chosen] || chosen;
+}
+
+function buildGeminiModelCandidates(model) {
+  const candidates = [resolveGeminiModel(model)];
+  for (const fallback of FALLBACK_GEMINI_MODELS) {
+    const resolved = resolveGeminiModel(fallback);
+    if (!candidates.includes(resolved)) candidates.push(resolved);
+  }
+  return candidates;
+}
+
+function isModelUnavailableError(message = "") {
+  return /no longer available|not found|is not found|deprecated|does not have permission/i.test(message);
+}
+
+function extractGeminiErrorMessage(json, status) {
+  const err = json && json.error;
+  if (err && typeof err === "object" && err.message) return String(err.message);
+  if (typeof err === "string") {
+    const details = json.details ? ` — ${String(json.details).slice(0, 300)}` : "";
+    return `${err}${details}`;
+  }
+  if (json && json.message) return String(json.message);
+  return `Error ${status}`;
+}
+
+async function fetchGemini(model, payload, data, hasCustomKey) {
+  if (hasCustomKey) {
+    console.log("[DEBUG] Using Custom User API Key, model:", model);
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${data.customApiKey}`;
+    return fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  console.log("[DEBUG] Routing to Django Backend Proxy, model:", model);
+  const backendProxyUrl = await buildBackendUrl('/api/gemini-proxy/');
+  return fetch(backendProxyUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "X-Extension-Id": chrome.runtime.id,
+      "X-Client-Feature": "iitb-mail-extension",
+    },
+    body: JSON.stringify({ model, payload }),
+  });
+}
+
+async function handleGeminiProxy(req, sendResponse) {
+  chrome.storage.local.get(['customApiKey', 'selectedModel'], async (data) => {
+    const hasCustomKey = !!data.customApiKey;
+
+    const payload = req.payload || {
+      contents: [{ parts: [{ text: req.prompt }] }]
+    };
+
+    try {
+      const candidates = buildGeminiModelCandidates(req.model || data.selectedModel);
+      let res = null;
+      let lastError = "";
+
+      for (const model of candidates) {
+        res = await fetchGemini(model, payload, data, hasCustomKey);
+        if (res.ok) break;
+
+        const errJson = await res.json().catch(() => ({}));
+        lastError = extractGeminiErrorMessage(errJson, res.status);
+        res = null;
+
+        if (!isModelUnavailableError(lastError)) break;
+      }
+
+      if (!res) {
+        sendResponse({
+          ok: false,
+          error: hasCustomKey ? `Custom Key Error: ${lastError}` : `Backend Error: ${lastError}`,
+        });
+        return;
+      }
+
+      const json = await res.json();
+
+      const text = json.summary ||
+                   json.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n") ||
+                   "No response generated.";
+
+      sendResponse({ ok: true, text });
+
+    } catch (err) {
+      console.error("[DEBUG] Proxy Error:", err);
+      sendResponse({ ok: false, error: "Network error. Please check your connection and try again." });
+    }
+  });
+}
+
+async function handleCalendarFlow(eventData, cardId, eventId = null, forceSelect = false) {
+  const data = await chrome.storage.local.get(['sessionToken']);
+  let token = cachedToken || data.sessionToken;
+
+  if (token && !forceSelect) {
+    executeCalendarInsert(token, eventData, cardId, eventId);
+    return;
+  }
+
+  if (isAuthPending) {
+    console.log("Auth already in progress. Queueing request for:", cardId);
+    const checkInterval = setInterval(() => {
+        if (cachedToken || !isAuthPending) {
+            clearInterval(checkInterval);
+            if (cachedToken) executeCalendarInsert(cachedToken, eventData, cardId, eventId);
+        }
+    }, 500);
+    return;
+  }
+
+  const clientId = "204923188074-lev69m2gnnock5k9btjvqmle7pono50r.apps.googleusercontent.com";
+  const redirectUri = `https://${chrome.runtime.id}.chromiumapp.org/`;
+  const scopes = encodeURIComponent("https://www.googleapis.com/auth/calendar.events");
+
+  const authUrl =
+    `https://accounts.google.com/o/oauth2/v2/auth` +
+    `?client_id=${clientId}` +
+    `&response_type=token` +
+    `&redirect_uri=${redirectUri}` +
+    `&scope=${scopes}&prompt=select_account`;
+
+  isAuthPending = true;
+
+  chrome.identity.launchWebAuthFlow(
+    { url: authUrl, interactive: true },
+    async (redirectUrl) => {
+      isAuthPending = false;
+
+      if (chrome.runtime.lastError || !redirectUrl) {
+        if (forceSelect && !(eventData && eventData.title)) {
+          chrome.runtime.sendMessage({
+            type: "GOOGLE_ACCOUNT_SWITCH_RESULT",
+            status: "error",
+            message: "Google account switch failed."
+          });
+        } else {
+          chrome.runtime.sendMessage({
+            type: "CALENDAR_RESULT",
+            status: "error",
+            message: "Google login failed.",
+            cardId: cardId
+          });
+        }
+        return;
+      }
+
+      const params = new URLSearchParams(new URL(redirectUrl).hash.substring(1));
+      const newToken = params.get("access_token");
+      if (newToken) {
+        cachedToken = newToken;
+        await chrome.storage.local.set({ sessionToken: newToken });
+
+        setTimeout(() => {
+            cachedToken = null;
+            chrome.storage.local.remove('sessionToken');
+        }, 3600000);
+
+        if (eventData && eventData.title) {
+          executeCalendarInsert(newToken, eventData, cardId, eventId);
+        } else if (forceSelect) {
+          chrome.runtime.sendMessage({
+            type: "GOOGLE_ACCOUNT_SWITCH_RESULT",
+            status: "success",
+            message: "Google account switched successfully."
+          });
+        }
+      }
+    }
+  );
+}
+
+async function executeCalendarInsert(token, data, cardId, eventId = null) {
+  const startTimeVal = data.startTime || data.time;
+
+  const event = {
+    summary: data.title,
+    description: data.description || "Added via IITB Mail Assistant",
+  };
+
+  if (startTimeVal && startTimeVal.trim() !== "") {
+    const startDateTime = `${data.date}T${startTimeVal}:00`;
+    let endDateTime;
+
+    if (data.endTime && /^\d{2}:\d{2}$/.test(data.endTime)) {
+      endDateTime = `${data.date}T${data.endTime}:00`;
+    } else {
+      const [hours, minutes] = startTimeVal.split(':').map(Number);
+      let endHours = hours + 1;
+      let endDate = data.date;
+
+      if (endHours >= 24) {
+          endHours = 0;
+      }
+      const pad = (n) => n.toString().padStart(2, '0');
+      endDateTime = `${endDate}T${pad(endHours)}:${pad(minutes)}:00`;
+    }
+
+    event.start = { dateTime: startDateTime, timeZone: "Asia/Kolkata" };
+    event.end = { dateTime: endDateTime, timeZone: "Asia/Kolkata" };
+  } else {
+    event.start = { date: data.date };
+    event.end = { date: data.date };
+  }
+
+  const url = eventId
+    ? `https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`
+    : "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+
+  const method = eventId ? "PATCH" : "POST";
+
+  try {
+    const res = await fetch(url, {
+        method: method,
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(event)
+      }
+    );
+
+    if (res.status === 401) {
+      cachedToken = null;
+      await chrome.storage.local.remove('sessionToken');
+      handleCalendarFlow(data, cardId, eventId);
+      return;
+    }
+
+    if (res.ok) {
+      const savedEvent = await res.json();
+      chrome.runtime.sendMessage({
+        type: "CALENDAR_RESULT",
+        status: "success",
+        cardId: cardId,
+        eventId: savedEvent.id
+      });
+
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "Icons/icon_128.png",
+        title: eventId ? "Event Updated" : "Event Scheduled",
+        message: startTimeVal ? `Scheduled for ${startTimeVal} (IST)` : `Scheduled as All Day Event`,
+        priority: 2
+      });
+    } else {
+      const errorInfo = await res.json();
+      chrome.runtime.sendMessage({ type: "CALENDAR_RESULT", status: "error", message: errorInfo.error?.message, cardId: cardId });
+    }
+  } catch (err) {
+    chrome.runtime.sendMessage({ type: "CALENDAR_RESULT", status: "error", message: "Network error.", cardId: cardId });
+  }
+
+}

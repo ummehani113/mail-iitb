@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>IITB Mail Assistant</title>
+  <link rel="stylesheet" href="popup.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body style="width: 100%; min-width: 320px; margin: 0; padding: 0; overflow-x: hidden; display: flex; flex-direction: column; min-height: 100vh;">
+
+  <div style="flex: 1;">
+    <header class="header" style="padding: 12px 16px; border-bottom: 1px solid #e5e7eb; background: #ffffff;">
+      <div class="header-content" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+        <div style="flex: 0 0 50px; display: flex; justify-content: flex-start;">
+          <img src="icons/DAV_LOGO_FINAL.png" alt="DAV" style="height: 28px; width: auto; object-fit: contain; flex-shrink: 0;">
+        </div>
+
+        <h1 style="font-size: 15px; font-weight: 600; margin: 0; flex: 1; text-align: center; white-space: nowrap;">Webmail Assistant</h1>
+
+        <div style="flex: 0 0 50px; display: flex; justify-content: flex-end;">
+          <img src="icons/UGAC_LOGO_FINAL.PNG" alt="UGAC" style="height: 28px; width: auto; object-fit: contain; flex-shrink: 0;">
+        </div>
+      </div>
+    </header>
+
+    <main class="accordion">
+
+      <section class="accordion-item" id="setup-section">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+            <span>Set up your API key (Optional)</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+
+        <div class="accordion-content">
+          <p style="font-size: 13px; color: #4b5563; line-height: 1.5; margin-bottom: 12px;">
+            To ensure uninterrupted service, you can use your own free Gemini API Key. It will be <strong>saved locally</strong> on your device. <a href="https://youtu.be/Uyn-P2nRvDA?si=lzqPUtUQblr42DIa" target="_blank" rel="noopener noreferrer">How to find one?</a>
+          </p>
+
+          <label class="field-label">API Key</label>
+          <input type="password" id="userApiKey" class="full-select" placeholder="Enter your key here">
+
+          <button id="saveSettings" class="primary-btn large-btn" style="margin-top: 10px;">
+            Save API Key
+          </button>
+
+          <label class="field-label" style="margin-top: 12px;">Model</label>
+          <select id="modelSelect" class="full-select" style="margin-top: 6px;">
+            <option value="gemini-3.8-flash" selected>gemini-3.8-flash</option>
+            <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+            <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+            <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview</option>
+            <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+            <option value="gemini-2.5-flash">gemini-2.5-flash (retired, auto-upgrades)</option>
+            <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (retired, auto-upgrades)</option>
+            <option value="gemini-2.5-pro">gemini-2.5-pro (retired, auto-upgrades)</option>
+          </select>
+
+          <div id="model-note" class="muted" style="margin-top:6px; font-size:12px;">Model selection is locked to gemini-3.8-flash until you enter a custom API key. Retired model names are automatically swapped for their replacement.</div>
+
+          <label class="field-label" style="margin-top: 14px;">Backend URL (optional)</label>
+          <input type="text" id="backendBaseUrl" class="full-select" placeholder="auto-detect">
+          <div class="muted" style="margin-top:6px; font-size:11px;">
+            Leave this empty. The panel automatically uses your local server when it is running,
+            and the hosted backend otherwise. Only type an address here to force one.
+          </div>
+
+          <div id="setup-status" class="status-text" style="margin-top: 8px;"></div>
+        </div>
+      </section>
+
+      <section class="accordion-item" id="chat-section">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span>Chat with my inbox</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+
+        <div class="accordion-content">
+          <p class="muted" style="font-size: 11px; margin-bottom: 10px;">
+            Keeps a sliding <strong>15-day</strong> copy of your inbox and answers questions about it.
+            Needs your LDAP credentials (below) and Gemini API key (above).
+          </p>
+
+          <div class="chat-sync-row">
+            <span id="chat-sync-status" class="status-text" style="flex: 1;">Not synced yet</span>
+            <button id="syncWindowBtn" class="secondary-btn chat-sync-btn">Sync 15 days</button>
+          </div>
+
+          <button id="openChatWindowBtn" class="secondary-btn" style="width: 100%; margin-top: 8px;"
+            title="Open the chatbot in its own window — the robot button on webmail opens it too">
+            Open chat window ↗
+          </button>
+
+          <div id="chat-messages" class="chat-messages">
+            <div class="chat-bubble chat-assistant">
+              Ask me anything about your last 15 days of mail — deadlines, who replied, unread work, or “summarise today”.
+            </div>
+          </div>
+
+          <div id="chat-suggestions" class="chat-suggestions"></div>
+
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" class="chat-input" placeholder="Ask about your mail…" autocomplete="off">
+            <button id="chatSendBtn" class="chat-send-btn" title="Send">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </div>
+          <div id="chat-status" class="status-text"></div>
+        </div>
+      </section>
+
+      <section class="accordion-item summary-accordion" id="summary-section">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="4" width="20" height="16" rx="2"></rect>
+              <polyline points="22,6 12,13 2,6"></polyline>
+            </svg>
+            <span>Summarize this email</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+
+        <div class="accordion-content">
+          <label class="field-label">Summary Mode</label>
+
+          <select id="mode" class="full-select">
+            <option value="brief">Brief</option>
+            <option value="detailed">Detailed</option>
+          </select>
+
+          <button id="summMail" class="primary-btn large-btn">
+            Summarize Mail
+          </button>
+
+          <div id="summary-status" class="status-text"></div>
+
+          <div id="summary-result" class="summary-placeholder">
+            Open an email to generate summary.
+          </div>
+        </div>
+      </section>
+
+      <section class="accordion-item" id="calendar-section">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="18" rx="2"></rect>
+              <line x1="16" y1="2" x2="16" y2="6"></line>
+              <line x1="8" y1="2" x2="8" y2="6"></line>
+              <line x1="3" y1="10" x2="21" y2="10"></line>
+            </svg>
+            <span>Add to Calendar</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+
+        <div class="accordion-content">
+          <div id="calendar-status" class="status-text"></div>
+          <button id="calOnly" class="primary-btn large-btn" style="margin-bottom: 12px;">
+            Check this Mail for Events
+          </button>
+
+          <button id="manualEntry" class="primary-btn large-btn" style="margin-bottom: 12px; background-color: #000000; color: #ffffff; border: none;">
+            Add Event Manually
+          </button>
+          <button id="switchAccountBtn" class="primary-btn large-btn" style="margin-bottom: 12px; background-color: #000000; color: #ffffff; border: none;">
+            Switch Google Account
+          </button>
+
+          <div id="calendar-result"></div>
+        </div>
+      </section>
+
+      <section class="accordion-item" id="reply-section">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 17 4 12 9 7"></polyline>
+              <path d="M20 18v-2a4 4 0 0 0-4-4H4"></path>
+            </svg>
+            <span>AI Reply Generator</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+
+        <div class="accordion-content">
+          <div id="reply-status" class="status-text"></div>
+
+          <button id="recordBtnReply" class="primary-btn" style="width: 100%; margin-bottom: 8px; background-color: #000; color: white; display: flex; align-items: center; justify-content: center; gap: 8px; border: none; padding: 8px; border-radius: 8px; font-size: 12px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="23"></line>
+              <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+            <span>Voice Typing</span>
+          </button>
+
+          <textarea id="replyPrompt" class="full-select" placeholder="Optional: Add instructions (e.g. be more formal, accept politely, decline)"></textarea>
+
+          <button id="replyMail" class="primary-btn large-btn">
+            Generate Reply
+          </button>
+
+          <div id="reply-result" style="margin-top: 12px;"></div>
+        </div>
+      </section>
+
+      <section class="accordion-item" id="compose-section">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 20h9"></path>
+              <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path>
+            </svg>
+            <span>Compose New Mail</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+
+        <div class="accordion-content">
+          <div id="compose-status" class="status-text"></div>
+
+          <button id="recordBtnCompose" class="primary-btn" style="width: 100%; margin-bottom: 8px; background-color: #000; color: white; display: flex; align-items: center; justify-content: center; gap: 8px; border: none; padding: 8px; border-radius: 8px; font-size: 12px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="23"></line>
+              <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+            <span>Voice Typing</span>
+          </button>
+
+          <textarea id="composeIntent" class="full-select" placeholder="Enter intent and generate mail."></textarea>
+
+          <button id="composeMail" class="primary-btn large-btn">
+            Generate Email
+          </button>
+
+          <div id="compose-result" style="margin-top: 12px;"></div>
+        </div>
+      </section>
+
+      <section class="accordion-item">
+        <button class="accordion-header">
+          <span class="accordion-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="4" rx="1"></rect>
+              <path d="M4 6h16v16H4z"></path>
+              <line x1="8" y1="10" x2="16" y2="10"></line>
+              <line x1="8" y1="14" x2="16" y2="14"></line>
+            </svg>
+            <span>Daily Summary</span>
+          </span>
+          <span class="chevron"></span>
+        </button>
+        <div class="accordion-content">
+          <p class="muted" style="font-size: 11px; margin-bottom: 10px;">Fetches inbox emails for the selected date and generates a brief overview. Note: requires LDAP ID and access token as authorization. To be granted in the LDAP credentials section below.</p>
+          <label class="field-label">Summary Date</label>
+          <input type="date" id="dailySummaryDate" class="full-select" style="margin-bottom:10px;">
+          <button id="getDailySummaryBtn" class="primary-btn large-btn" style="width:100%; margin-bottom:10px;">Generate Summary</button>
+          <div id="daily-summary-status" class="status-text"></div>
+          <div id="daily-summary-result" class="summary-card" style="display:none;">
+              </div>
+        </div>
+      </section>
+
+      <section class="accordion-item" id="settings-section">
+  <button class="accordion-header">
+    <span class="accordion-title">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="7.5" cy="15.5" r="5.5"></circle>
+  <path d="m21 2-9.6 9.6"></path>
+  <path d="m15.5 7.5 3 3L22 7l-3-3.5"></path>
+</svg>
+
+      <span>LDAP Credentials</span>
+    </span>
+    <span class="chevron"></span>
+  </button>
+
+  <div class="accordion-content">
+
+    <p style="font-size: 13px; color: #4b5563; line-height: 1.5; margin-bottom: 12px;">
+  To be able to utilize the daily summary feature, we require your LDAP ID and an LDAP access token. It is <strong>saved locally</strong> on your device. <a href="https://docs.google.com/document/d/1gr8QbA7Un36PDgkdLLMULKdFJzr0JNeHbcP0FUzeLaI/edit?usp=sharing" target="_blank" rel="noopener noreferrer">How to generate an access token?</a>
+  </p>
+    <div id="auth-status-banner" style="font-size: 11px; margin-bottom: 12px; padding: 8px; border-radius: 6px; background: var(--bg-soft); border: 1px solid var(--border); display: flex; align-items: center; gap: 6px;">
+      <span id="auth-status-dot" style="height: 6px; width: 6px; border-radius: 50%; background: #94a3b8;"></span>
+      <span id="auth-status-text" style="color: var(--muted); font-weight: 500;">Checking status...</span>
+    </div>
+
+    <div class="settings-group">
+      <label class="input-label">LDAP Username</label>
+      <input type="text" id="ldap-user" placeholder="e.g. 24b0975" class="custom-input">
+
+      <label class="input-label">LDAP Access Token</label>
+      <input type="password" id="ldap-pass" placeholder="LDAP access token" class="custom-input">
+
+      <button id="saveCredsBtn" class="primary-btn large-btn action-btn">Save Credentials</button>
+    </div>
+
+    <div class="settings-divider"></div>
+
+    <button id="logoutBtn" class="secondary-btn danger-text">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px;"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+      Logout & Clear Data
+    </button>
+    <p id="logout-status" class="status-text"></p>
+  </div>
+</section>
+
+    </main>
+  </div>
+
+  <footer style="padding: 16px; border-top: 1px solid #eee; background: #f9f9f9; text-align: center; margin-top: auto;">
+    <div style="font-size: 11px; color: #444; line-height: 1.6; margin-bottom: 8px;">
+        Made with ❤️ by <br>
+        <strong>Data Analytics and Visualization Team, UGAC</strong> <br>
+    </div>
+
+    <div style="margin-bottom: 10px;">
+        <a href="https://forms.gle/HgBqCCfp1TwAfdRT7" target="_blank" style="font-size: 12px; color: #020617; font-weight: 600; text-decoration: underline;">
+            Share Feedback
+        </a>
+    </div>
+  </footer>
+
+  <script src="store.js"></script>
+  <script src="context.js"></script>
+  <script src="chat.js"></script>
+  <script src="popup.js"></script>
+</body>
+
+</html>
