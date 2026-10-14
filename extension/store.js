@@ -5,7 +5,6 @@ const MAIL_WINDOW_EMAILS = "emails";
 const MAIL_WINDOW_META = "meta";
 const MAIL_WINDOW_META_KEY = "window";
 const MAIL_WINDOW_SYNC_GAP_MS = 5 * 60 * 1000;
-const MAIL_WINDOW_SINCE_OVERLAP_MS = 60 * 1000;
 const MAIL_WINDOW_BACKEND_BASE = "https://webmailextensionugac-260151192882.asia-south1.run.app";
 const MAIL_WINDOW_LOCAL_CANDIDATES = ["http://127.0.0.1:8000", "http://localhost:8000"];
 
@@ -101,33 +100,41 @@ async function detectMailWindowBackend(stored) {
   return { base: MAIL_WINDOW_BACKEND_BASE, source: "hosted" };
 }
 
+// The server keeps nothing: it reports every UID currently in the window, which
+// of them are unread, and sends full details only for mails newer than ours.
 async function applyMailWindowSync(payload, metaExtra = {}) {
   const db = await openMailWindowDb();
   const tx = db.transaction([MAIL_WINDOW_EMAILS, MAIL_WINDOW_META], "readwrite");
   const emailsStore = tx.objectStore(MAIL_WINDOW_EMAILS);
   const metaStore = tx.objectStore(MAIL_WINDOW_META);
 
+  const inWindow = new Set((payload.window_uids || []).map(Number));
+  const unseen = new Set((payload.unseen_uids || []).map(Number));
+
   if (payload.full) emailsStore.clear();
 
-  const windowStartIso = new Date(`${payload.window_start}T00:00:00+05:30`).toISOString();
-  const pruneCursor = emailsStore
-    .index("receivedAt")
-    .openCursor(IDBKeyRange.upperBound(windowStartIso, true));
-  pruneCursor.onsuccess = () => {
-    const cursor = pruneCursor.result;
+  // Drop mails that left the window (older than 15 days, deleted or moved),
+  // and refresh read/unread for the ones we keep.
+  const cursorRequest = emailsStore.openCursor();
+  cursorRequest.onsuccess = () => {
+    const cursor = cursorRequest.result;
     if (!cursor) return;
-    cursor.delete();
+    const row = cursor.value;
+    if (!inWindow.has(Number(row.uid))) {
+      cursor.delete();
+    } else {
+      const isRead = !unseen.has(Number(row.uid));
+      if (row.isRead !== isRead) cursor.update({ ...row, isRead });
+    }
     cursor.continue();
   };
 
-  for (const uid of payload.pruned_uids || []) {
-    emailsStore.delete(Number(uid));
-  }
   for (const raw of payload.emails || []) {
     const emailRow = normalizeWindowEmail(raw);
     if (emailRow.receivedAt) emailsStore.put(emailRow);
   }
 
+  const uids = [...inWindow];
   metaStore.put({
     key: MAIL_WINDOW_META_KEY,
     windowStart: payload.window_start,
@@ -135,7 +142,8 @@ async function applyMailWindowSync(payload, metaExtra = {}) {
     syncedAt: payload.synced_at,
     count: payload.total_in_window,
     full: !!payload.full,
-    stats: payload.stats || {},
+    uidValidity: payload.uid_validity || "",
+    maxUid: uids.length ? Math.max(...uids) : 0,
     ...metaExtra,
   });
 
@@ -193,8 +201,10 @@ async function syncMailWindow(options = {}) {
   const target = await detectMailWindowBackend(stored);
   const base = target.base;
   const params = new URLSearchParams({ days: String(days) });
-  if (!force && lastSyncMs) {
-    params.set("since", new Date(lastSyncMs - MAIL_WINDOW_SINCE_OVERLAP_MS).toISOString());
+  const localCount = (await getMailWindowEmails().catch(() => [])).length;
+  if (meta && meta.uidValidity && meta.maxUid && localCount) {
+    params.set("uidvalidity", meta.uidValidity);
+    params.set("max_uid", String(meta.maxUid));
   }
 
   let response;
