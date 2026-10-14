@@ -434,6 +434,10 @@ function isModelUnavailableError(message = "") {
   return /no longer available|not found|is not found|deprecated|does not have permission/i.test(message);
 }
 
+function isModelBusyError(message = "", status = 0) {
+  return status === 503 || status === 500 || /high demand|overloaded|UNAVAILABLE|try again later/i.test(message);
+}
+
 function extractGeminiErrorMessage(json, status) {
   const err = json && json.error;
   if (err && typeof err === "object" && err.message) return String(err.message);
@@ -483,15 +487,26 @@ async function handleGeminiProxy(req, sendResponse) {
       let res = null;
       let lastError = "";
 
+      outer:
       for (const model of candidates) {
-        res = await fetchGemini(model, payload, data, hasCustomKey);
-        if (res.ok) break;
+        // Google sometimes answers "high demand" (503). Retry the same model
+        // once after a short pause, then move on to the next model.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          res = await fetchGemini(model, payload, data, hasCustomKey);
+          if (res.ok) break outer;
 
-        const errJson = await res.json().catch(() => ({}));
-        lastError = extractGeminiErrorMessage(errJson, res.status);
-        res = null;
+          const status = res.status;
+          const errJson = await res.json().catch(() => ({}));
+          lastError = extractGeminiErrorMessage(errJson, status);
+          res = null;
 
-        if (!isModelUnavailableError(lastError)) break;
+          if (isModelBusyError(lastError, status)) {
+            if (attempt === 0) await new Promise((r) => setTimeout(r, 2500));
+            continue;
+          }
+          if (isModelUnavailableError(lastError)) continue outer;
+          break outer;
+        }
       }
 
       if (!res) {

@@ -1003,12 +1003,15 @@ function renderDailyError(message, canRetry) {
 function geminiErrorHint(error) {
   const text = String(error || "");
   if (/429|quota|exceeded|rate/i.test(text)) {
-    return `Gemini's usage limit was reached, so no summary could be written. Wait a minute and retry, or save your own API key in "Set up your API key". Details: ${text}`;
+    return `Gemini's usage limit was reached for this key. Wait a minute and retry, or save your own API key in "Set up your API key". Details: ${text}`;
+  }
+  if (/high demand|overloaded|UNAVAILABLE|try again later/i.test(text)) {
+    return `Google's Gemini servers are busy right now (not a problem with your key). Wait a minute and try again. Details: ${text.replace(/^Error:\s*/, "")}`;
   }
   if (/api key not valid|API_KEY_INVALID|permission/i.test(text)) {
     return `The Gemini API key was rejected. Check the key in "Set up your API key". Details: ${text}`;
   }
-  return `Gemini could not write the summary. Details: ${text}`;
+  return `Gemini request failed. Details: ${text.replace(/^Error:\s*/, "")}`;
 }
 
 async function generateDailySummary({ reuseMails = false } = {}) {
@@ -1344,7 +1347,7 @@ ${body.slice(0, 12000)}
 
     sendToGemini(combinedPrompt, res => {
         if (!res || !res.ok) {
-          showMessage("Gemini failed", "summary", true);
+          showMessage(geminiErrorHint(res && res.text), "summary", true);
           return;
         }
 
@@ -1466,7 +1469,7 @@ ${body.slice(0, 12000)}
         calendarChecked = true;
         if (!res || !res.ok) {
           renderCalendarResult([]);
-          showMessage("Failed", "calendar", true);
+          showMessage(geminiErrorHint(res && res.text), "calendar", true);
           return;
         }
         try {
@@ -1550,7 +1553,7 @@ ${body.slice(0, 12000)}
 
     sendToGemini(prompt, res => {
         if (!res || !res.ok) {
-          showMessage("Reply generation failed", "reply", true);
+          showMessage(geminiErrorHint(res && res.text), "reply", true);
           return;
         }
 
@@ -1619,7 +1622,7 @@ function modifyReply(mode) {
 
   sendToGemini(prompt, res => {
       if (!res || !res.ok) {
-        showMessage("Modification failed", "reply", true);
+        showMessage(geminiErrorHint(res && res.text), "reply", true);
         return;
       }
       currentReplyText = res.text;
@@ -1691,7 +1694,7 @@ ${intent}
 
     sendToGemini(prompt, res => {
         if (!res || !res.ok) {
-          showMessage("Compose failed", "compose", true);
+          showMessage(geminiErrorHint(res && res.text), "compose", true);
           return;
         }
 
@@ -1727,7 +1730,7 @@ function modifyCompose(mode) {
 
   sendToGemini(prompt, res => {
       if (!res || !res.ok) {
-        showMessage("Modification failed", "compose", true);
+        showMessage(geminiErrorHint(res && res.text), "compose", true);
         return;
       }
 
