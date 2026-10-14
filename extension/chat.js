@@ -178,52 +178,34 @@ function sendChatPayload(payload, model, uidById) {
   });
 }
 
+function requestOpenMail(uid) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "OPEN_MAIL", uid: Number(uid) }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { ok: false, error: "No response from the extension." });
+      });
+    } catch (err) {
+      resolve({ ok: false, error: err && err.message ? err.message : String(err) });
+    }
+  });
+}
+
 async function openWebmailMessage(uid) {
   const numUid = Number(uid);
-
   if (!numUid || Number.isNaN(numUid)) {
     setChatStatus("That citation has no mail link (older chat message) — ask the question again to get clickable ones.");
     setTimeout(() => setChatStatus(""), 6000);
     return;
   }
 
-  const listUrl = "https://webmail.iitb.ac.in/?_task=mail&_mbox=INBOX";
-  console.log("[IITB Citation] opening uid", numUid);
-
-  try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    const active = tabs[0];
-    const onWebmail = !!(active && (active.url || "").includes("webmail.iitb.ac.in"));
-
-    if (onWebmail) {
-      setChatStatus(`Opening mail #${numUid}…`);
-
-      const result = await chrome.tabs
-        .sendMessage(active.id, { type: "OPEN_MESSAGE", uid: numUid })
-        .catch(() => null);
-      console.log("[IITB Citation] content script says:", result);
-      if (result && result.ok) {
-        setChatStatus("");
-        return;
-      }
-
-      await chrome.storage.local.set({
-        pendingOpenUid: { uid: numUid, timestamp: Date.now() },
-      });
-      await chrome.tabs.update(active.id, { url: listUrl });
-      return;
-    }
-
-    await chrome.storage.local.set({
-      pendingOpenUid: { uid: numUid, timestamp: Date.now() },
-    });
-    await chrome.tabs.create({ url: listUrl });
-  } catch (err) {
-    console.error("[IITB Citation] open failed:", err);
-    chrome.storage.local.set({
-      pendingOpenUid: { uid: numUid, timestamp: Date.now() },
-    }, () => window.open(listUrl, "_blank"));
-  }
+  setChatStatus("Opening mail…");
+  const result = await requestOpenMail(numUid);
+  setChatStatus(result.ok ? "" : result.error);
+  if (!result.ok) setTimeout(() => setChatStatus(""), 6000);
 }
 
 async function handleChatSend() {

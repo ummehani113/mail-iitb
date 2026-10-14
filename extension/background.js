@@ -21,16 +21,40 @@ async function buildBackendUrl(path) {
   return `${base}${normalizedPath}`;
 }
 
+// The service worker is stopped after ~30s idle and its memory is wiped. The
+// per-tab panel state is mirrored to chrome.storage.session so a page reload
+// after a restart does not close an open panel.
+const SIDE_PANEL_STATE_KEY = "sidePanelStateByTab";
+
+const sidePanelStateLoaded = chrome.storage.session
+  .get([SIDE_PANEL_STATE_KEY])
+  .then((data) => {
+    const saved = (data && data[SIDE_PANEL_STATE_KEY]) || {};
+    for (const [tabId, state] of Object.entries(saved)) {
+      if (!sidePanelStateByTab.has(Number(tabId))) {
+        sidePanelStateByTab.set(Number(tabId), state);
+      }
+    }
+  })
+  .catch(() => {});
+
+function persistSidePanelState() {
+  const plain = Object.fromEntries(sidePanelStateByTab);
+  chrome.storage.session.set({ [SIDE_PANEL_STATE_KEY]: plain }).catch(() => {});
+}
+
 function getSidePanelState(tabId) {
   return sidePanelStateByTab.get(tabId) || { autoOpened: false, opened: false, manuallyClosed: false };
 }
 
 function setSidePanelState(tabId, nextState) {
   sidePanelStateByTab.set(tabId, nextState);
+  persistSidePanelState();
 }
 
 function clearSidePanelState(tabId) {
   sidePanelStateByTab.delete(tabId);
+  persistSidePanelState();
 }
 
 function isWebmailUrl(url = "") {
@@ -60,6 +84,9 @@ function markTabState(tabId, updates) {
 }
 
 async function syncTabSidePanel(tabId, url = "") {
+  await sidePanelStateLoaded;
+  // Unknown tab: leave the panel alone instead of closing it.
+  if (!sidePanelStateByTab.has(tabId)) return;
   const state = getSidePanelState(tabId);
   await applySidePanelOptions(tabId, state.opened === true);
 }
@@ -128,7 +155,155 @@ async function openOrFocusChatWindow() {
 }
 
 
+
+/* -------------------- Open a mail inside webmail (no page reload) -------------------- */
+
+const WEBMAIL_INBOX_URL = "https://webmail.iitb.ac.in/?_task=mail&_mbox=INBOX";
+
+// Runs inside the webmail page itself (MAIN world), where Roundcube's own
+// `rcmail` object lives. Must be self-contained.
+function roundcubeOpenInPreview(uid, mbox) {
+  const rc = window.rcmail;
+  if (!rc || !rc.env) return { ok: false, reason: "no-roundcube" };
+  if (rc.env.task !== "mail") return { ok: false, reason: "not-mail-task" };
+
+  const key = String(uid);
+  const list = rc.message_list;
+
+  // 1. The mail is in the list on screen: select it like a normal click.
+  try {
+    if (list && list.rows && list.rows[key] && (rc.env.mailbox || "INBOX") === mbox) {
+      list.select(key);
+      if (typeof list.scrollto === "function") list.scrollto(key);
+      return { ok: true, method: "select" };
+    }
+  } catch (err) {
+    // fall through to the preview pane
+  }
+
+  // 2. Not on this page: load it straight into the preview pane.
+  try {
+    const frameName = rc.env.contentframe;
+    const frameWindow = frameName && rc.get_frame_window(frameName);
+    if (!frameWindow) return { ok: false, reason: "no-preview-pane" };
+
+    if (list && typeof list.clear_selection === "function") list.clear_selection();
+
+    const query = { _uid: key, _mbox: mbox, _framed: 1 };
+    if (typeof rc.browser_capabilities === "function") query._caps = rc.browser_capabilities();
+
+    rc.preview_id = key;
+    rc.location_href(rc.url("preview", query), frameWindow, true);
+    if (typeof rc.show_contentframe === "function") rc.show_contentframe(true);
+    return { ok: true, method: "preview" };
+  } catch (err) {
+    return { ok: false, reason: `preview-failed: ${err && err.message ? err.message : err}` };
+  }
+}
+
+function waitForTabComplete(tabId, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    let finished = false;
+    const done = (value) => {
+      if (finished) return;
+      finished = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const listener = (updatedId, info) => {
+      if (updatedId === tabId && info.status === "complete") done(true);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab && tab.status === "complete") done(true);
+    }).catch(() => done(false));
+  });
+}
+
+async function findWebmailTab() {
+  const tabs = await chrome.tabs.query({ url: "*://webmail.iitb.ac.in/*" });
+  if (!tabs.length) return null;
+
+  let focusedWindowId = null;
+  try {
+    const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    focusedWindowId = win && win.id;
+  } catch (err) {
+    // ignore
+  }
+
+  return (
+    tabs.find((tab) => tab.active && tab.windowId === focusedWindowId) ||
+    tabs.find((tab) => tab.active) ||
+    tabs[0]
+  );
+}
+
+async function runRoundcubeOpen(tabId, uid, mbox) {
+  // Roundcube finishes setting itself up shortly after the page loads.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    let result = null;
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        world: "MAIN",
+        func: roundcubeOpenInPreview,
+        args: [uid, mbox],
+      });
+      result = injection && injection.result;
+    } catch (err) {
+      result = { ok: false, reason: `inject-failed: ${err && err.message ? err.message : err}` };
+    }
+
+    if (result && (result.ok || result.reason !== "no-roundcube")) return result;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return { ok: false, reason: "no-roundcube" };
+}
+
+async function openMailInWebmail(uid, mbox = "INBOX") {
+  const cleanUid = Number(uid);
+  if (!Number.isInteger(cleanUid) || cleanUid <= 0) {
+    return { ok: false, error: "This item has no mail link." };
+  }
+
+  let tab = await findWebmailTab();
+
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: WEBMAIL_INBOX_URL, active: true });
+    await waitForTabComplete(tab.id);
+  } else {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  }
+
+  let result = await runRoundcubeOpen(tab.id, cleanUid, mbox);
+
+  // Webmail is showing something other than the mail list (compose, settings,
+  // a full-screen message): go to the inbox once, then open it in the preview.
+  if (!result.ok) {
+    await chrome.tabs.update(tab.id, { url: WEBMAIL_INBOX_URL });
+    await waitForTabComplete(tab.id);
+    result = await runRoundcubeOpen(tab.id, cleanUid, mbox);
+  }
+
+  if (!result.ok) {
+    return { ok: false, error: `Could not open the mail in webmail (${result.reason}).` };
+  }
+  return { ok: true, method: result.method };
+}
+
+
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  if (req.type === "OPEN_MAIL") {
+    openMailInWebmail(req.uid, req.mbox || "INBOX")
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: (err && err.message) || String(err) }));
+    return true;
+  }
+
   if (req.type === "OPEN_CHAT_WINDOW") {
     openOrFocusChatWindow()
       .then((result) => sendResponse(result))

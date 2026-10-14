@@ -25,21 +25,6 @@ chrome.storage.local.get(['pendingCompose'], (result) => {
   }
 });
 
-if (window === window.top) {
-  chrome.storage.local.get(['pendingOpenUid'], (result) => {
-    const pending = result.pendingOpenUid;
-    if (!pending) return;
-    chrome.storage.local.remove('pendingOpenUid');
-    if (Date.now() - pending.timestamp < 30000) {
-      openMessageByUid(pending.uid, 80).then((res) => {
-        if (!res || !res.ok) {
-          location.href = "?_task=mail&_mbox=INBOX";
-        }
-      });
-    }
-  });
-}
-
 function handleNewComposeInjection(subject, body) {
   let attempts = 0;
   const timer = setInterval(() => {
@@ -181,32 +166,6 @@ function waitForMailBody(maxAttempts = 10, interval = 300) {
 }
 
 
-async function openMessageByUid(uid, attemptsAllowed = 40) {
-  const cleanUid = String(Number(uid));
-  if (!cleanUid || cleanUid === "NaN") {
-    return { ok: false, error: "Invalid message uid" };
-  }
-
-  for (let attempt = 0; attempt < attemptsAllowed; attempt++) {
-    const row = document.querySelector(`tr[id="rcmrow${cleanUid}"]`);
-    if (row) {
-      const link = row.querySelector("a") || row;
-      link.click();
-      return { ok: true, method: "row-click" };
-    }
-
-    const link = document.querySelector(`a[href*="_uid=${cleanUid}"]`);
-    if (link) {
-      link.click();
-      return { ok: true, method: "link-click" };
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-
-  return { ok: false, error: "Message row not found in the open list" };
-}
-
 function findReplyButton(root = document) {
   return root.querySelector(
     'a.reply[title="Reply to sender"], a.reply#rcmbtn124'
@@ -266,12 +225,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       });
     });
 
-    return true;
-  }
-
-  if (req?.type === "OPEN_MESSAGE") {
-    if (window !== window.top) return;
-    openMessageByUid(req.uid).then((result) => sendResponse(result));
     return true;
   }
 

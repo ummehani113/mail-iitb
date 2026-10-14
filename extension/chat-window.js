@@ -121,9 +121,6 @@ window.refreshMailWindowStatus = async function refreshMailWindowStatus() {
 };
 
 
-const CW_WEBMAIL_MATCH = "https://webmail.iitb.ac.in/*";
-const CW_LIST_URL = "https://webmail.iitb.ac.in/?_task=mail&_mbox=INBOX";
-
 function cwMinimiseSelf() {
   if (!cwWindowId) return;
   try {
@@ -142,56 +139,14 @@ window.openWebmailMessage = async function openWebmailMessage(uid) {
     return;
   }
 
-  console.log("[IITB Citation] window opening uid", numUid);
+  setChatStatus("Opening mail…");
+  const result = await requestOpenMail(numUid);
 
-  try {
-    const tabs = await chrome.tabs.query({ url: CW_WEBMAIL_MATCH });
-    const webmailTab =
-      tabs.find((tab) => tab.active && !tab.hidden) || tabs.find((tab) => !tab.hidden) || tabs[0];
-
-    if (webmailTab) {
-      try {
-        await chrome.windows.update(webmailTab.windowId, { focused: true });
-      } catch (err) {
-      }
-      await chrome.tabs.update(webmailTab.id, { active: true });
-
-      setChatStatus(`Opening mail #${numUid}…`);
-      const result = await chrome.tabs
-        .sendMessage(webmailTab.id, { type: "OPEN_MESSAGE", uid: numUid })
-        .catch(() => null);
-      console.log("[IITB Citation] content script says:", result);
-
-      if (!(result && result.ok)) {
-        await chrome.storage.local.set({
-          pendingOpenUid: { uid: numUid, timestamp: Date.now() },
-        });
-        await chrome.tabs.update(webmailTab.id, { url: CW_LIST_URL });
-      }
-    } else {
-      await chrome.storage.local.set({
-        pendingOpenUid: { uid: numUid, timestamp: Date.now() },
-      });
-
-      let targetWindowId = null;
-      try {
-        const normalWindows = await chrome.windows.getAll({ windowTypes: ["normal"] });
-        const host = normalWindows.find((win) => win.focused) || normalWindows[0];
-        if (host) targetWindowId = host.id;
-      } catch (err) {
-        targetWindowId = null;
-      }
-
-      await chrome.tabs.create({
-        url: CW_LIST_URL,
-        ...(targetWindowId !== null ? { windowId: targetWindowId } : {}),
-      });
-    }
-
+  if (result.ok) {
+    setChatStatus("");
     setTimeout(cwMinimiseSelf, 250);
-  } catch (err) {
-    console.error("[IITB Citation] window open failed:", err);
-    setChatStatus("Could not open that mail — is the webmail tab still open?");
+  } else {
+    setChatStatus(result.error || "Could not open that mail.");
     setTimeout(() => setChatStatus(""), 6000);
   }
 };
