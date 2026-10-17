@@ -497,7 +497,9 @@ async function handleGeminiProxy(req, sendResponse) {
                    json.candidates?.[0]?.content?.parts?.map(p => p.text).join("\n") ||
                    "No response generated.";
 
-      sendResponse({ ok: true, text });
+      // "MAX_TOKENS" means Gemini stopped mid-answer (thinking tokens count too).
+      const finishReason = (json.raw || json).candidates?.[0]?.finishReason || "";
+      sendResponse({ ok: true, text, truncated: finishReason === "MAX_TOKENS" });
 
     } catch (err) {
       console.error("[DEBUG] Proxy Error:", err);

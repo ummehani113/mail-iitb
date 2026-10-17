@@ -2,6 +2,9 @@ const CHAT_HISTORY_KEY = "chatHistory";
 const CHAT_HISTORY_LIMIT = 40;
 const CHAT_TURN_LIMIT = 1500;
 const CHAT_TURNS_SENT = 6;
+// Gemini 3 models spend part of this on thinking, so keep it generous or the
+// reply gets cut off mid-sentence.
+const CHAT_MAX_OUTPUT_TOKENS = 8192;
 
 const CHAT_SUGGESTIONS = [
   "Any deadlines in the next 7 days?",
@@ -230,7 +233,7 @@ function sendChatPayload(payload, model, uidById) {
         resolve({ ok: false, error: chrome.runtime.lastError.message || "Extension message failed." });
         return;
       }
-      if (response && response.ok) resolve({ ok: true, text: response.text || "", uidById });
+      if (response && response.ok) resolve({ ok: true, text: response.text || "", truncated: !!response.truncated, uidById });
       else resolve({ ok: false, error: (response && response.error) || "No response from Gemini." });
     });
   });
@@ -357,7 +360,7 @@ async function handleChatSend() {
     const payload = {
       systemInstruction: { parts: [{ text: context.systemText }] },
       contents,
-      generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+      generationConfig: { temperature: 0.3, maxOutputTokens: CHAT_MAX_OUTPUT_TOKENS },
     };
 
     const answer = await sendChatPayload(payload, model, context.uidById || {});
@@ -373,6 +376,9 @@ async function handleChatSend() {
     }
 
     const uids = collectChatCitations(answer.text, answer.uidById || {});
+    if (answer.truncated) {
+      note = [note, 'Gemini stopped before finishing this answer. Ask "continue" for the rest.'].filter(Boolean).join(" ");
+    }
     const entry = { role: "assistant", text: answer.text, uids, note };
     renderChatMessage({ ...entry, uids: answer.uidById || {} });
 
