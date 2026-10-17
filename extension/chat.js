@@ -97,6 +97,14 @@ function formatChatText(text, uidById = {}) {
   return parts.join("");
 }
 
+// Drops a trailing line that stops mid-sentence (used only if Gemini still
+// runs out of room after the shorter retry).
+function trimToCompleteLines(text) {
+  const lines = String(text || "").trimEnd().split("\n");
+  while (lines.length > 1 && !/[.!?)\]]\s*$/.test(lines[lines.length - 1])) lines.pop();
+  return lines.join("\n");
+}
+
 function collectChatCitations(text, uidById) {
   const found = {};
   const pattern = /\[(E\d+)\]/g;
@@ -363,7 +371,27 @@ async function handleChatSend() {
       generationConfig: { temperature: 0.3, maxOutputTokens: CHAT_MAX_OUTPUT_TOKENS },
     };
 
-    const answer = await sendChatPayload(payload, model, context.uidById || {});
+    let answer = await sendChatPayload(payload, model, context.uidById || {});
+
+    // Gemini ran out of room mid-answer: ask once more for a shorter, complete
+    // answer instead of showing a half one.
+    if (answer.ok && answer.truncated) {
+      if (thinking) thinking.innerHTML = "<p>Making the answer shorter…</p>";
+      const shorter = {
+        ...payload,
+        systemInstruction: {
+          parts: [{
+            text: `${context.systemText}\n\nIMPORTANT: your previous attempt was too long and got cut off. ` +
+              "Answer again in at most 5 lines starting with \"- \", each at most 15 words, most urgent first. " +
+              "Keep the [E12] citations. Finish every sentence.",
+          }],
+        },
+      };
+      const retry = await sendChatPayload(shorter, model, context.uidById || {});
+      if (retry.ok) answer = retry;
+    }
+    // Last resort: never show a half sentence.
+    if (answer.ok && answer.truncated) answer.text = trimToCompleteLines(answer.text);
 
     if (thinking) thinking.remove();
     thinking = null;
@@ -376,9 +404,6 @@ async function handleChatSend() {
     }
 
     const uids = collectChatCitations(answer.text, answer.uidById || {});
-    if (answer.truncated) {
-      note = [note, 'Gemini stopped before finishing this answer. Ask "continue" for the rest.'].filter(Boolean).join(" ");
-    }
     const entry = { role: "assistant", text: answer.text, uids, note };
     renderChatMessage({ ...entry, uids: answer.uidById || {} });
 
